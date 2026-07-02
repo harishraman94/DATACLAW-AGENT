@@ -12,6 +12,7 @@ from dataclaw_context_research.tools import (
     context_research_list_findings,
     context_research_save_to_okf,
     context_research_search_reddit,
+    context_research_search_sources,
     context_research_summarize_findings,
 )
 
@@ -30,6 +31,14 @@ class RedditSearchRequest(BaseModel):
     problem_statement: str = ""
     limit: int = 10
     subreddit: str = ""
+
+
+class SourceSearchRequest(BaseModel):
+    query: str
+    sources: list[str] | None = None
+    dataset_id: str = ""
+    problem_statement: str = ""
+    limit: int = 8
 
 
 class SaveToOKFRequest(BaseModel):
@@ -58,6 +67,17 @@ async def search_reddit_route(req: RedditSearchRequest) -> dict[str, Any]:
         problem_statement=req.problem_statement,
         limit=req.limit,
         subreddit=req.subreddit,
+    )
+
+
+@router.post("/sources/search")
+async def search_sources_route(req: SourceSearchRequest) -> dict[str, Any]:
+    return await context_research_search_sources(
+        query=req.query,
+        sources=req.sources,
+        dataset_id=req.dataset_id,
+        problem_statement=req.problem_statement,
+        limit=req.limit,
     )
 
 

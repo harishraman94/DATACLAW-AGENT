@@ -15,6 +15,7 @@ from dataclaw_context_research.tools import (
     context_research_list_findings,
     context_research_save_to_okf,
     context_research_search_reddit,
+    context_research_search_sources,
     context_research_summarize_findings,
     set_plugin_cfg,
 )
@@ -54,6 +55,30 @@ class ContextResearchPlugin:
                         "problem_statement": {"type": "string", "description": "Optional problem statement", "default": ""},
                         "limit": {"type": "integer", "description": "Maximum results to fetch", "default": 10},
                         "subreddit": {"type": "string", "description": "Optional subreddit name", "default": ""},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            (
+                "context_research_search_sources",
+                "Search academic papers, arXiv, GitHub, and optionally Reddit for cited open-world context",
+                context_research_search_sources,
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "sources": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["semantic_scholar", "arxiv", "github_repositories", "github_issues", "reddit"],
+                            },
+                            "description": "Sources to search",
+                            "default": ["semantic_scholar", "arxiv", "github_repositories"],
+                        },
+                        "dataset_id": {"type": "string", "description": "Optional dataset ID to attach findings to", "default": ""},
+                        "problem_statement": {"type": "string", "description": "Optional problem statement", "default": ""},
+                        "limit": {"type": "integer", "description": "Maximum results per source", "default": 8},
                     },
                     "required": ["query"],
                 },
@@ -134,6 +159,20 @@ class ContextResearchPlugin:
                     label="Max Results",
                     description="Maximum external results per search",
                     default=15,
+                ),
+                PluginConfigField(
+                    name="semantic_scholar_api_key",
+                    field_type="string",
+                    label="Semantic Scholar API Key",
+                    description="Optional API key for higher Semantic Scholar rate limits",
+                    default="",
+                ),
+                PluginConfigField(
+                    name="github_token",
+                    field_type="string",
+                    label="GitHub Token",
+                    description="Optional token for GitHub search rate limits",
+                    default="",
                 ),
             ],
         )
