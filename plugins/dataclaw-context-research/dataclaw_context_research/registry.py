@@ -19,6 +19,10 @@ def findings_path() -> Path:
     return context_root() / "findings.json"
 
 
+def programs_path() -> Path:
+    return context_root() / "programs.json"
+
+
 def cache_dir() -> Path:
     path = context_root() / "cache"
     path.mkdir(parents=True, exist_ok=True)
@@ -92,6 +96,54 @@ def mark_saved_to_okf(finding_ids: list[str], bundle_id: str) -> None:
             finding = {**finding, "accepted_for_okf": True, "okf_bundle_id": bundle_id}
         findings.append(finding)
     write_findings(findings)
+
+
+def read_programs() -> list[dict[str, Any]]:
+    path = programs_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def write_programs(programs: list[dict[str, Any]]) -> None:
+    path = programs_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(programs, indent=2, default=str), encoding="utf-8")
+
+
+def save_program(program: dict[str, Any]) -> dict[str, Any]:
+    item = dict(program)
+    item.setdefault("id", f"program-{uuid.uuid4().hex[:10]}")
+    item.setdefault("created_at", now_iso())
+    item["updated_at"] = now_iso()
+    programs = read_programs()
+    for idx, existing in enumerate(programs):
+        if existing.get("id") == item["id"]:
+            programs[idx] = item
+            write_programs(programs)
+            return item
+    programs.insert(0, item)
+    write_programs(programs)
+    return item
+
+
+def find_program(program_id: str) -> dict[str, Any]:
+    for program in read_programs():
+        if program.get("id") == program_id:
+            return program
+    raise ValueError(f"Research program not found: {program_id}")
+
+
+def filter_programs(*, dataset_id: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    programs = read_programs()
+    if dataset_id:
+        programs = [p for p in programs if p.get("dataset_id") == dataset_id]
+    programs.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+    return programs[: max(0, int(limit))]
 
 
 def _dedupe_key(finding: dict[str, Any]) -> str:

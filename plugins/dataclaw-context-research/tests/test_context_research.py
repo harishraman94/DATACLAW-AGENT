@@ -12,13 +12,17 @@ from dataclaw_context_research.academic import parse_arxiv, parse_semantic_schol
 from dataclaw_context_research.github import parse_github_repositories
 from dataclaw_context_research.query import generate_queries
 from dataclaw_context_research.reddit import parse_reddit_search
-from dataclaw_context_research.registry import filter_findings, read_findings
+from dataclaw_context_research.registry import filter_findings, find_program, read_findings
 from dataclaw_context_research.tools import (
+    context_research_build_program,
     context_research_list_findings,
+    context_research_run_parallel_experiments,
+    context_research_save_program_to_okf,
     context_research_save_to_okf,
     context_research_search_reddit,
     context_research_search_sources,
     context_research_summarize_findings,
+    set_delegate_to_subagent,
 )
 from dataclaw_okf.generator import generate_bundle
 
@@ -267,6 +271,86 @@ async def test_summarize_and_save_findings_to_okf(monkeypatch, survey_dataset):
     assert "weak" in text
     assert "Churn leakage warning" in text
     assert read_findings()[0]["accepted_for_okf"] is True
+
+
+@pytest.mark.asyncio
+async def test_build_research_program_creates_hypotheses_and_experiment_tasks(monkeypatch, survey_dataset):
+    async def fake_search_reddit(**kwargs):
+        return [
+            {
+                "query": kwargs["query"],
+                "source": "semantic_scholar",
+                "source_type": "paper",
+                "evidence_level": "strong",
+                "title": "Feature engineering for churn prediction",
+                "url": "https://example.com/paper",
+                "snippet": "Feature engineering and temporal validation improve churn prediction.",
+                "tags": ["academic"],
+                "accepted_for_okf": False,
+            }
+        ]
+
+    monkeypatch.setattr("dataclaw_context_research.tools.search_reddit", fake_search_reddit)
+    await context_research_search_reddit(query="churn feature engineering", dataset_id=survey_dataset["id"])
+
+    program = await context_research_build_program(
+        dataset_id=survey_dataset["id"],
+        problem_statement="Improve churn prediction with external context and better experiments.",
+    )
+
+    assert program["id"].startswith("program-")
+    assert program["hypotheses"]
+    assert program["external_data_candidates"]
+    assert program["experiment_branches"]
+    assert program["subagent_tasks"]
+    assert program["feedback_loop"]["baseline_required"] is True
+    assert find_program(program["id"])["dataset_id"] == survey_dataset["id"]
+
+
+@pytest.mark.asyncio
+async def test_save_research_program_to_okf(monkeypatch, survey_dataset):
+    program = await context_research_build_program(
+        dataset_id=survey_dataset["id"],
+        problem_statement="Improve survey churn analysis.",
+    )
+    bundle = generate_bundle(survey_dataset["id"])
+
+    result = await context_research_save_program_to_okf(
+        bundle_id=bundle["id"],
+        program_id=program["id"],
+    )
+
+    assert result["path"] == "notes/research_program.md"
+    text = (Path(bundle["path"]) / "notes" / "research_program.md").read_text(encoding="utf-8")
+    assert "Research Program" in text
+    assert "Experiment Branches" in text
+    assert "Feedback Loop" in text
+
+
+@pytest.mark.asyncio
+async def test_parallel_experiment_runner_uses_delegate_mock(survey_dataset):
+    program = await context_research_build_program(
+        dataset_id=survey_dataset["id"],
+        problem_statement="Improve survey churn analysis.",
+    )
+    calls = []
+
+    async def fake_delegate_to_subagent(**kwargs):
+        calls.append(kwargs)
+        return {"status": "completed", "result": "mocked experiment result"}
+
+    set_delegate_to_subagent(fake_delegate_to_subagent)
+
+    result = await context_research_run_parallel_experiments(
+        program_id=program["id"],
+        subagent_names=["experimenter-a", "experimenter-b"],
+        max_tasks=2,
+    )
+
+    assert result["status"] == "completed"
+    assert result["tasks_dispatched"] == 2
+    assert len(calls) == 2
+    assert {c["subagent_name"] for c in calls} == {"experimenter-a", "experimenter-b"}
 
 
 @pytest.mark.asyncio
