@@ -9,6 +9,10 @@ from dataclaw.plugins.base import (
 )
 from dataclaw.providers.tool.implementations.python_tool import PythonTool
 
+from dataclaw_context_research.hooks import (
+    external_research_first_plan_hook,
+    external_research_first_prompt_hook,
+)
 from dataclaw_context_research.router import router as context_router
 from dataclaw_context_research.tools import (
     context_research_build_program,
@@ -36,6 +40,8 @@ class ContextResearchPlugin:
         if delegate_tool is not None:
             set_delegate_to_subagent(delegate_tool.execute)
         ctx.include_api_router(context_router, prefix="/context-research", tags=["context-research"])
+        ctx.hooks.register("postSystemPromptHook", external_research_first_prompt_hook)
+        ctx.hooks.register("preToolCallHook", external_research_first_plan_hook)
 
         tools = [
             (

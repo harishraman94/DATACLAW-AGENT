@@ -1,0 +1,162 @@
+"""Hooks that make external context research part of Dataclaw planning."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+from dataclaw.state import AgentState
+
+
+EXTERNAL_RESEARCH_FIRST_PROMPT = """
+
+## External Context Research
+For open-ended data science work, treat external context gathering as the first analytical step, before committing to modeling, validation, or experiment design. Use the context research tools to:
+- generate concept-level queries from the user's problem, dataset descriptions, table names, and schema signals;
+- search high-signal sources such as academic papers, arXiv, reputable technical blogs or maintained repositories, GitHub discussions/issues, and Reddit when available;
+- identify useful external data sources, benchmark methods, domain constraints, leakage risks, evaluation protocols, and feature-engineering hypotheses;
+- save durable findings or research programs into OKF when an OKF bundle is available;
+- compare any external-enriched experiments against a provided-data-only baseline.
+
+Plans for experiments should place this external research and enrichment phase before EDA validation, baseline modeling, or parallel subagent experiments. If relevant research already exists for the dataset or project, summarize and reuse it instead of repeating the same search.
+"""
+
+RESEARCH_STEP_NAME = "External context and data discovery"
+RESEARCH_STEP_DESCRIPTION = (
+    "Before modeling or validation, inspect the available dataset context and run "
+    "external research. Generate concept-level queries from the problem and schema, "
+    "search academic/repository/community sources as available, identify useful "
+    "external data candidates and domain constraints, save durable findings to OKF "
+    "when possible, and use the results to shape hypotheses and experiment branches."
+)
+
+_RESEARCH_TERMS = (
+    "external context",
+    "external research",
+    "context research",
+    "research program",
+    "source discovery",
+    "external data",
+    "enrichment",
+)
+
+_ANALYTICAL_PLAN_TERMS = (
+    "analysis",
+    "analyze",
+    "dataset",
+    "data",
+    "eda",
+    "experiment",
+    "feature",
+    "forecast",
+    "hypothesis",
+    "mlflow",
+    "model",
+    "notebook",
+    "predict",
+    "regression",
+    "train",
+    "validate",
+    "validation",
+)
+
+
+async def external_research_first_prompt_hook(state: AgentState) -> AgentState:
+    """postSystemPromptHook: add first-step research guidance to the prompt."""
+    prompt = state.get("system_prompt", "")
+    if not prompt or EXTERNAL_RESEARCH_FIRST_PROMPT.strip() in prompt:
+        return state
+
+    return {
+        **state,
+        "system_prompt": prompt.rstrip() + EXTERNAL_RESEARCH_FIRST_PROMPT,
+    }
+
+
+async def external_research_first_plan_hook(state: AgentState) -> AgentState:
+    """preToolCallHook: keep external research first in proposed experiment plans."""
+    pending = state.get("pending_tool_calls", [])
+    if not pending:
+        return state
+
+    updated = []
+    changed = False
+    for tool_call in pending:
+        if tool_call.get("tool_name") != "propose_plan":
+            updated.append(tool_call)
+            continue
+
+        tool_input = tool_call.get("tool_input", {})
+        revised = prioritize_external_research_step(tool_input)
+        if revised is tool_input:
+            updated.append(tool_call)
+            continue
+
+        updated.append({**tool_call, "tool_input": revised})
+        changed = True
+
+    if not changed:
+        return state
+    return {**state, "pending_tool_calls": updated}
+
+
+def prioritize_external_research_step(tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return tool input with external research as the first plan step when relevant."""
+    steps = tool_input.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return tool_input
+    if not _looks_like_analytical_plan(tool_input):
+        return tool_input
+
+    if not any(isinstance(step, dict) for step in steps):
+        return tool_input
+
+    existing_index = next(
+        (
+            idx
+            for idx, step in enumerate(steps)
+            if isinstance(step, dict) and _is_external_research_step(step)
+        ),
+        None,
+    )
+    if existing_index == 0:
+        return tool_input
+
+    new_steps = deepcopy(steps)
+    if existing_index is None:
+        new_steps.insert(0, _new_research_step())
+    else:
+        step = new_steps.pop(existing_index)
+        new_steps.insert(0, step)
+
+    return {**tool_input, "steps": new_steps}
+
+
+def _new_research_step() -> dict[str, Any]:
+    return {
+        "name": RESEARCH_STEP_NAME,
+        "description": RESEARCH_STEP_DESCRIPTION,
+        "status": "not_started",
+        "summary": "",
+        "outputs": [],
+    }
+
+
+def _is_external_research_step(step: dict[str, Any]) -> bool:
+    text = _combined_text(step)
+    return any(term in text for term in _RESEARCH_TERMS)
+
+
+def _looks_like_analytical_plan(tool_input: dict[str, Any]) -> bool:
+    text = _combined_text(tool_input)
+    return any(term in text for term in _ANALYTICAL_PLAN_TERMS)
+
+
+def _combined_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return " ".join(_combined_text(v) for v in value.values()).lower()
+    if isinstance(value, list):
+        return " ".join(_combined_text(v) for v in value).lower()
+    if isinstance(value, str):
+        return value.lower()
+    return ""
