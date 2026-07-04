@@ -10,7 +10,7 @@ import asyncio
 from dataclaw_context_research.academic import search_arxiv, search_semantic_scholar
 from dataclaw_context_research.github import search_github_issues, search_github_repositories
 from dataclaw_context_research.program import build_research_program, program_markdown
-from dataclaw_context_research.query import generate_queries
+from dataclaw_context_research.query import generate_queries_with_llm
 from dataclaw_context_research.reddit import search_reddit
 from dataclaw_context_research.registry import (
     filter_findings,
@@ -26,11 +26,17 @@ from dataclaw_okf.registry import find_bundle, upsert_bundle
 
 _plugin_cfg: dict[str, Any] = {}
 _delegate_to_subagent: Any = None
+_llm_provider: Any = None
 
 
 def set_plugin_cfg(cfg: dict[str, Any]) -> None:
     global _plugin_cfg
     _plugin_cfg = cfg or {}
+
+
+def set_llm_provider(provider: Any) -> None:
+    global _llm_provider
+    _llm_provider = provider
 
 
 def set_delegate_to_subagent(fn: Any) -> None:
@@ -45,7 +51,12 @@ async def context_research_generate_queries(
     limit: int = 8,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    return generate_queries(dataset_id=dataset_id, problem_statement=problem_statement, limit=limit)
+    return await generate_queries_with_llm(
+        llm=_llm_provider,
+        dataset_id=dataset_id,
+        problem_statement=problem_statement,
+        limit=limit,
+    )
 
 
 async def context_research_search_reddit(
@@ -311,6 +322,8 @@ def _summarize_program(program: dict[str, Any]) -> dict[str, Any]:
         "target_guess": program.get("target_guess", ""),
         "source_summary": program.get("source_summary", {}),
         "hypotheses": program.get("hypotheses", []),
+        "methodology_translations": program.get("methodology_translations", []),
+        "ablation_plan": program.get("ablation_plan", []),
         "external_data_candidates": program.get("external_data_candidates", []),
         "experiment_branches": program.get("experiment_branches", []),
         "subagent_tasks": program.get("subagent_tasks", []),

@@ -10,8 +10,9 @@ import dataclaw.config.paths as paths
 from dataclaw_data.registry import create_dataset
 from dataclaw_context_research.academic import parse_arxiv, parse_semantic_scholar
 from dataclaw_context_research.github import parse_github_repositories
-from dataclaw_context_research.query import generate_queries
-from dataclaw_context_research.reddit import parse_reddit_search
+from dataclaw_context_research.query import generate_queries, generate_queries_with_llm
+from dataclaw.providers.llm.provider import TextDeltaEvent, TurnCompleteEvent
+from dataclaw_context_research.reddit import parse_reddit_search, search_reddit
 from dataclaw_context_research.registry import filter_findings, find_program, read_findings
 from dataclaw_context_research.tools import (
     context_research_build_program,
@@ -64,6 +65,105 @@ def test_generate_queries_uses_schema_as_concept_signal(survey_dataset):
     assert "churn" in joined or "satisfaction" in joined
 
 
+def test_generate_queries_expands_problem_understanding_beyond_literal_keywords():
+    problem = "Predict which users will stop paying after a bad onboarding experience"
+    result = generate_queries(problem_statement=problem, limit=8)
+
+    joined = " ".join(result["queries"]).lower()
+    assert result["inferred_domain"] == "saas"
+    assert result["inferred_objective"] == "prediction"
+    assert result["problem_understanding"]["target"] == "churn"
+    assert "customer retention" in joined
+    assert "subscription churn" in joined
+    assert "cancellation propensity" in joined or "retention risk" in joined
+    assert "literature review" in joined
+    assert "benchmark dataset" in joined
+    assert problem.lower() not in [q.lower() for q in result["queries"]]
+
+
+def test_generate_queries_uses_domain_research_language_for_real_estate():
+    result = generate_queries(
+        problem_statement="Predict house sale price from property attributes",
+        limit=8,
+    )
+
+    joined = " ".join(result["queries"]).lower()
+    assert result["inferred_domain"] == "real estate"
+    assert result["problem_understanding"]["target"] == "saleprice"
+    assert "residential property valuation" in joined
+    assert "hedonic pricing" in joined
+    assert "neighborhood amenities" in joined
+
+
+def test_generate_queries_understands_educational_game_event_logs():
+    problem = (
+        "Predict student performance from educational game play event logs. "
+        "Before modeling, perform deep external research, identify external data/enrichment "
+        "candidates, create hypotheses, dispatch parallel experiment branches to subagents, "
+        "and compare all enriched branches against a provided-data-only baseline."
+    )
+
+    result = generate_queries(problem_statement=problem, limit=10)
+
+    joined = " ".join(result["queries"]).lower()
+    concepts = result["concepts"]
+    understanding = result["problem_understanding"]
+    assert result["inferred_domain"] == "education / learning analytics"
+    assert result["inferred_objective"] == "sequence prediction"
+    assert understanding["target"] == "student performance"
+    assert "learning analytics" in joined
+    assert "educational data mining" in joined
+    assert "student performance prediction" in joined
+    assert "game based learning analytics" in joined
+    assert "knowledge tracing benchmarks" in joined
+    assert "student level leakage" in joined or "session temporal leakage" in joined
+    assert "subagents" not in concepts
+    assert "branches" not in concepts
+
+
+@pytest.mark.asyncio
+async def test_generate_queries_uses_llm_understanding_when_provider_available():
+    class FakeResearchLLM:
+        async def stream_turn(self, messages, *, system, tools):
+            assert not tools
+            assert "Do not merely reuse keywords" in system
+            text = """{
+              "problem_understanding": {
+                "real_world_domain": "educational game-based learning",
+                "analytical_objective": "sequence-based student performance prediction",
+                "unit_of_analysis": "student game session",
+                "outcome_or_target": "assessment performance",
+                "data_modality": "gameplay event logs",
+                "source_context": "educational data mining and learning analytics",
+                "research_angles": ["knowledge tracing", "student modeling"],
+                "external_enrichment_angles": ["curriculum metadata", "item difficulty"],
+                "validation_risks": ["student-level leakage", "temporal leakage"]
+              },
+              "queries": [
+                "educational data mining gameplay event logs student performance prediction",
+                "game based learning analytics knowledge tracing assessment performance benchmark",
+                "student modeling event sequence features temporal validation leakage"
+              ]
+            }"""
+            yield TextDeltaEvent(text=text)
+            yield TurnCompleteEvent()
+
+        def build_tool_result_message(self, tool_calls, results, errors):
+            return []
+
+    result = await generate_queries_with_llm(
+        llm=FakeResearchLLM(),
+        problem_statement="Predict student performance from educational game play event logs",
+        limit=3,
+    )
+
+    joined = " ".join(result["queries"]).lower()
+    assert result["generation_mode"] == "llm"
+    assert result["inferred_domain"] == "educational game-based learning"
+    assert "knowledge tracing" in joined
+    assert "temporal validation" in joined
+
+
 def test_parse_reddit_search_labels_findings_as_weak_community_evidence():
     payload = {
         "data": {
@@ -93,6 +193,39 @@ def test_parse_reddit_search_labels_findings_as_weak_community_evidence():
     assert finding["evidence_level"] == "weak"
     assert finding["url"].startswith("https://www.reddit.com/")
     assert "unverified" in finding["tags"]
+
+
+@pytest.mark.asyncio
+async def test_public_reddit_search_uses_json_endpoint(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": {"children": []}}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls.append({"init": kwargs})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, *, params):
+            calls.append({"url": url, "params": params})
+            return FakeResponse()
+
+    monkeypatch.setattr("dataclaw_context_research.reddit.httpx.AsyncClient", FakeClient)
+
+    await search_reddit(query="student performance")
+
+    assert calls[0]["init"]["headers"] == {"User-Agent": "DataclawContextResearch/0.1"}
+    assert calls[1]["url"] == "https://www.reddit.com/search.json"
 
 
 def test_parse_semantic_scholar_normalizes_papers_as_strong_evidence():
@@ -300,10 +433,19 @@ async def test_build_research_program_creates_hypotheses_and_experiment_tasks(mo
 
     assert program["id"].startswith("program-")
     assert program["hypotheses"]
+    assert program["methodology_translations"]
+    assert program["ablation_plan"]
     assert program["external_data_candidates"]
     assert program["experiment_branches"]
     assert program["subagent_tasks"]
     assert program["feedback_loop"]["baseline_required"] is True
+    assert program["feedback_loop"]["ablation_required"] is True
+    assert "next_model_adjustment" in program["feedback_loop"]["required_result_fields"]
+    assert {"promote", "tune", "combine", "reject"} == set(program["feedback_loop"]["decision_values"])
+    assert any(item["variant"] == "single_methodology_ablation" for item in program["ablation_plan"])
+    assert program["experiment_branches"][0]["methodology_id"].startswith("m-")
+    assert program["experiment_branches"][0]["ablation_id"].startswith("abl-m-")
+    assert "next_model_adjustment" in program["subagent_tasks"][0]["task"]
     assert find_program(program["id"])["dataset_id"] == survey_dataset["id"]
 
 
@@ -323,6 +465,8 @@ async def test_save_research_program_to_okf(monkeypatch, survey_dataset):
     assert result["path"] == "notes/research_program.md"
     text = (Path(bundle["path"]) / "notes" / "research_program.md").read_text(encoding="utf-8")
     assert "Research Program" in text
+    assert "Methodology Translations" in text
+    assert "Ablation Plan" in text
     assert "Experiment Branches" in text
     assert "Feedback Loop" in text
 
@@ -351,6 +495,8 @@ async def test_parallel_experiment_runner_uses_delegate_mock(survey_dataset):
     assert result["tasks_dispatched"] == 2
     assert len(calls) == 2
     assert {c["subagent_name"] for c in calls} == {"experimenter-a", "experimenter-b"}
+    assert "delta_vs_baseline" in calls[0]["task"]
+    assert "promote/tune/combine/reject" in calls[0]["task"]
 
 
 @pytest.mark.asyncio

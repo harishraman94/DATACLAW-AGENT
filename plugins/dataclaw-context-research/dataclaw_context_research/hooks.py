@@ -16,9 +16,11 @@ For open-ended data science work, treat external context gathering as the first 
 - search high-signal sources such as academic papers, arXiv, reputable technical blogs or maintained repositories, GitHub discussions/issues, and Reddit when available;
 - identify useful external data sources, benchmark methods, domain constraints, leakage risks, evaluation protocols, and feature-engineering hypotheses;
 - save durable findings or research programs into OKF when an OKF bundle is available;
-- compare any external-enriched experiments against a provided-data-only baseline.
+- compare any external-enriched or research-methodology-guided experiments against a provided-data-only baseline;
+- run ablations that isolate each research-derived methodology, recording baseline metric, candidate metric, delta, diagnostics, and keep/tune/combine/reject decisions;
+- use validation feedback from each ablation to adjust later modeling branches instead of treating research as static decoration.
 
-Plans for experiments should place this external research and enrichment phase before EDA validation, baseline modeling, or parallel subagent experiments. If relevant research already exists for the dataset or project, summarize and reuse it instead of repeating the same search.
+Plans for experiments should place this external research and enrichment phase before EDA validation, baseline modeling, or parallel subagent experiments. Final modeling reports should include a methodology attribution table showing which research ideas were implemented, how they were translated into dataset-safe modeling choices, whether they improved metrics, and how the result changed the next model iteration. If relevant research already exists for the dataset or project, summarize and reuse it instead of repeating the same search.
 """
 
 RESEARCH_STEP_NAME = "External context and data discovery"
@@ -27,7 +29,9 @@ RESEARCH_STEP_DESCRIPTION = (
     "external research. Generate concept-level queries from the problem and schema, "
     "search academic/repository/community sources as available, identify useful "
     "external data candidates and domain constraints, save durable findings to OKF "
-    "when possible, and use the results to shape hypotheses and experiment branches."
+    "when possible, translate research methodologies into dataset-safe modeling "
+    "choices, require ablations against a provided-data-only baseline, and use "
+    "validation feedback to promote, tune, combine, or reject each branch."
 )
 
 _RESEARCH_TERMS = (

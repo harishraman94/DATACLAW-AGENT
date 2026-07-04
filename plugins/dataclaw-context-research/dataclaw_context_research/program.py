@@ -29,7 +29,15 @@ def build_research_program(
         limit=max_hypotheses,
     )
     external_data = _external_data_candidates(problem_statement, findings, domain_terms)
-    experiment_branches = _experiment_branches(hypotheses, external_data, dataset_id=dataset_id)
+    methodology_translations = _methodology_translations(hypotheses)
+    ablation_plan = _ablation_plan(methodology_translations)
+    feedback_loop = _feedback_loop(ablation_plan)
+    experiment_branches = _experiment_branches(
+        hypotheses,
+        external_data,
+        dataset_id=dataset_id,
+        ablation_plan=ablation_plan,
+    )
     return {
         "dataset_id": dataset_id,
         "problem_statement": problem_statement,
@@ -37,29 +45,18 @@ def build_research_program(
         "target_guess": target,
         "source_summary": _source_summary(findings),
         "hypotheses": hypotheses,
+        "methodology_translations": methodology_translations,
+        "ablation_plan": ablation_plan,
         "external_data_candidates": external_data,
         "experiment_branches": experiment_branches,
         "subagent_tasks": _subagent_tasks(experiment_branches),
-        "feedback_loop": {
-            "baseline_required": True,
-            "compare_against": "provided-data-only baseline",
-            "metrics_to_track": [
-                "validation metric improvement",
-                "generalization gap",
-                "data leakage risk",
-                "external-data coverage",
-                "feature stability",
-                "fairness/bias diagnostics where applicable",
-            ],
-            "iteration_rule": (
-                "Promote an enrichment or hypothesis only when it improves validation performance "
-                "without increasing leakage risk or degrading robustness diagnostics."
-            ),
-        },
+        "feedback_loop": feedback_loop,
         "caveats": [
             "External data must be license-compatible and time-aligned with the prediction/analysis target.",
             "Community/forum findings are weak signals; use them for hypotheses, not final claims.",
-            "Every promoted feature should have an ablation result against the baseline.",
+            "External research can improve methodology even when no external rows or joins are used.",
+            "Every promoted methodology should have an ablation result against the baseline.",
+            "Later modeling steps should be changed by validation feedback; weak research ideas should be rejected, tuned, or narrowed.",
         ],
     }
 
@@ -87,6 +84,14 @@ tags:
 ## Hypotheses
 
 {_hypothesis_lines(program.get("hypotheses", []))}
+
+## Methodology Translations
+
+{_methodology_lines(program.get("methodology_translations", []))}
+
+## Ablation Plan
+
+{_ablation_lines(program.get("ablation_plan", []))}
 
 ## External Data Candidates
 
@@ -216,20 +221,143 @@ def _external_data_candidates(problem_statement: str, findings: list[dict[str, A
     return candidates
 
 
-def _experiment_branches(hypotheses: list[dict[str, Any]], external_data: list[dict[str, Any]], *, dataset_id: str) -> list[dict[str, Any]]:
-    branches = []
+def _methodology_translations(hypotheses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    translations = []
     for hypothesis in hypotheses[:6]:
+        signals = hypothesis.get("signals_to_test", [])
+        translations.append({
+            "id": f"m-{hypothesis['id']}",
+            "hypothesis_id": hypothesis["id"],
+            "research_idea": hypothesis["statement"],
+            "dataset_safe_translation": (
+                "Translate the research idea into features, preprocessing, validation choices, "
+                "or model constraints that can be derived from the provided dataset before trying external joins."
+            ),
+            "candidate_methods": signals or ["domain-inspired feature engineering"],
+            "baseline_comparison": "Compare with the same model family on raw/provided-data-only features where feasible.",
+            "feedback_action": (
+                "Keep, tune, combine, or reject this methodology based on its ablation delta, "
+                "leakage checks, and robustness diagnostics."
+            ),
+        })
+    return translations
+
+
+def _ablation_plan(methodologies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    plan = [
+        {
+            "id": "abl-baseline",
+            "name": "Provided-data-only baseline",
+            "methodology_id": "",
+            "variant": "baseline",
+            "purpose": "Establish the metric before any research-guided methodology is added.",
+            "required_metrics": ["validation_metric", "fold_metrics", "prediction_distribution"],
+            "decision_use": "Reference point for every methodology delta.",
+        }
+    ]
+    for methodology in methodologies:
+        plan.append({
+            "id": f"abl-{methodology['id']}",
+            "name": f"Add methodology from {methodology['hypothesis_id']}",
+            "methodology_id": methodology["id"],
+            "variant": "single_methodology_ablation",
+            "purpose": "Isolate whether this research-derived method improves the baseline.",
+            "required_metrics": [
+                "baseline_validation_metric",
+                "candidate_validation_metric",
+                "delta_vs_baseline",
+                "leakage_check",
+                "robustness_check",
+            ],
+            "decision_use": "Promote only if the metric improves and diagnostics do not deteriorate.",
+        })
+    plan.append({
+        "id": "abl-final-selected",
+        "name": "Final selected research-guided model",
+        "methodology_id": "",
+        "variant": "selected_combination",
+        "purpose": "Combine only methodologies that survived single-methodology ablations or have a documented tuning rationale.",
+        "required_metrics": [
+            "baseline_validation_metric",
+            "final_validation_metric",
+            "delta_vs_baseline",
+            "included_methodologies",
+            "rejected_methodologies",
+        ],
+        "decision_use": "Document how earlier validation feedback changed the final model.",
+    })
+    return plan
+
+
+def _feedback_loop(ablation_plan: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "baseline_required": True,
+        "compare_against": "provided-data-only baseline",
+        "ablation_required": True,
+        "ablation_plan_ids": [item["id"] for item in ablation_plan],
+        "metrics_to_track": [
+            "validation metric improvement",
+            "delta versus provided-data-only baseline",
+            "generalization gap",
+            "data leakage risk",
+            "external-data coverage when external joins are attempted",
+            "feature stability",
+            "prediction distribution shift",
+            "fairness/bias diagnostics where applicable",
+        ],
+        "required_result_fields": [
+            "research_methodology",
+            "dataset_safe_translation",
+            "baseline_metric",
+            "candidate_metric",
+            "delta_vs_baseline",
+            "diagnostics",
+            "decision",
+            "next_model_adjustment",
+        ],
+        "decision_values": ["promote", "tune", "combine", "reject"],
+        "iteration_rule": (
+            "After each ablation, update the next model branch from the result: promote methods with validated lift, "
+            "tune methods with mixed diagnostics, combine complementary winners, and reject methods that fail metric, leakage, "
+            "or robustness checks."
+        ),
+        "reporting_rule": (
+            "Final reporting must include a table that links each research methodology to its implementation, metric delta, "
+            "feedback decision, and the concrete adjustment made to later modeling."
+        ),
+    }
+
+
+def _experiment_branches(
+    hypotheses: list[dict[str, Any]],
+    external_data: list[dict[str, Any]],
+    *,
+    dataset_id: str,
+    ablation_plan: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    branches = []
+    ablation_by_methodology = {
+        item.get("methodology_id"): item
+        for item in ablation_plan
+        if item.get("methodology_id")
+    }
+    for hypothesis in hypotheses[:6]:
+        methodology_id = f"m-{hypothesis['id']}"
+        ablation = ablation_by_methodology.get(methodology_id, {})
         branches.append({
             "id": f"exp-{hypothesis['id']}",
             "name": hypothesis["statement"][:80],
             "dataset_id": dataset_id,
             "hypothesis_id": hypothesis["id"],
+            "methodology_id": methodology_id,
+            "ablation_id": ablation.get("id", ""),
             "steps": [
                 "Reproduce provided-data-only baseline and record metric.",
-                "Engineer features or enrichments implied by the hypothesis.",
+                "Translate the research methodology into provided-data-safe features, preprocessing, validation, or model constraints.",
                 "Run validation with leakage-safe split.",
-                "Compare against baseline with ablation.",
-                "Report lift, failure mode, and whether to promote or reject.",
+                "Compare against baseline with a single-methodology ablation.",
+                "Use the result to choose the next adjustment: promote, tune, combine, or reject.",
+                "Report methodology, implementation, baseline metric, candidate metric, delta, diagnostics, decision, and next model adjustment.",
             ],
             "success_criteria": "Improves validation metric while passing leakage and robustness checks.",
         })
@@ -239,11 +367,14 @@ def _experiment_branches(hypotheses: list[dict[str, Any]], external_data: list[d
             "name": "External data discovery and join feasibility audit",
             "dataset_id": dataset_id,
             "hypothesis_id": "",
+            "methodology_id": "external-data-audit",
+            "ablation_id": "",
             "steps": [
                 "Inspect candidate external sources for accessible datasets or reproducible feature recipes.",
                 "Check licenses, coverage, join keys, and time alignment.",
                 "Prototype one safe join/enrichment only if feasibility is high.",
-                "Run ablation against baseline.",
+                "Run ablation against baseline if a safe join is feasible.",
+                "If joins are infeasible, convert source ideas into provided-data-safe methodologies and record the rejection reason.",
             ],
             "success_criteria": "Finds at least one license-compatible enrichment with measurable lift or useful negative evidence.",
         })
@@ -260,7 +391,9 @@ def _subagent_tasks(branches: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "task": (
                 f"Run experiment branch {branch['id']}: {branch['name']}. "
                 f"Steps: {'; '.join(branch['steps'])}. "
-                "Return baseline metric, enriched metric, ablation result, leakage risks, artifacts, and promote/reject recommendation."
+                "Return a structured feedback row with research_methodology, dataset_safe_translation, baseline_metric, "
+                "candidate_metric, delta_vs_baseline, diagnostics, decision (promote/tune/combine/reject), "
+                "next_model_adjustment, artifacts, and leakage risks."
             ),
         }
         for branch in branches
@@ -311,9 +444,31 @@ def _external_lines(items: list[dict[str, Any]]) -> str:
     ) or "- No external data candidates generated."
 
 
+def _methodology_lines(items: list[dict[str, Any]]) -> str:
+    lines = []
+    for item in items:
+        lines.append(f"### {item.get('id')}: {item.get('research_idea')}")
+        lines.append(f"- Dataset-safe translation: {item.get('dataset_safe_translation')}")
+        lines.append(f"- Candidate methods: `{item.get('candidate_methods', [])}`")
+        lines.append(f"- Baseline comparison: {item.get('baseline_comparison')}")
+        lines.append(f"- Feedback action: {item.get('feedback_action')}\n")
+    return "\n".join(lines) or "- No methodology translations generated."
+
+
+def _ablation_lines(items: list[dict[str, Any]]) -> str:
+    lines = []
+    for item in items:
+        lines.append(f"### {item.get('id')}: {item.get('name')}")
+        lines.append(f"- Variant: {item.get('variant')}")
+        lines.append(f"- Purpose: {item.get('purpose')}")
+        lines.append(f"- Required metrics: `{item.get('required_metrics', [])}`")
+        lines.append(f"- Decision use: {item.get('decision_use')}\n")
+    return "\n".join(lines) or "- No ablation plan generated."
+
+
 def _branch_lines(items: list[dict[str, Any]]) -> str:
     return "\n".join(
-        f"- **{item.get('id')}**: {item.get('name')} Success: {item.get('success_criteria')}"
+        f"- **{item.get('id')}**: {item.get('name')} Ablation: `{item.get('ablation_id', '')}` Success: {item.get('success_criteria')}"
         for item in items
     ) or "- No experiment branches generated."
 

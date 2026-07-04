@@ -26,6 +26,7 @@ from dataclaw_context_research.tools import (
     context_research_search_sources,
     context_research_summarize_findings,
     set_delegate_to_subagent,
+    set_llm_provider,
     set_plugin_cfg,
 )
 
@@ -36,6 +37,7 @@ class ContextResearchPlugin:
 
     def register(self, ctx: PluginContext) -> None:
         set_plugin_cfg(ctx.config.plugins.get("context-research", {}))
+        set_llm_provider(getattr(ctx.providers, "llm", None))
         delegate_tool = getattr(ctx.tool_registry, "_tools", {}).get("delegate_to_subagent")
         if delegate_tool is not None:
             set_delegate_to_subagent(delegate_tool.execute)
@@ -137,7 +139,7 @@ class ContextResearchPlugin:
             ),
             (
                 "context_research_build_program",
-                "Build a deep research program with hypotheses, external data candidates, experiment branches, and subagent tasks",
+                "Build a deep research program with methodology translations, ablation plans, feedback loops, experiment branches, and subagent tasks",
                 context_research_build_program,
                 {
                     "type": "object",
@@ -176,7 +178,7 @@ class ContextResearchPlugin:
             ),
             (
                 "context_research_run_parallel_experiments",
-                "Dispatch research-program experiment branches to configured Dataclaw subagents in parallel",
+                "Dispatch research-program methodology ablation branches to configured Dataclaw subagents in parallel",
                 context_research_run_parallel_experiments,
                 {
                     "type": "object",
@@ -206,13 +208,6 @@ class ContextResearchPlugin:
             pages=[],
             config_title="Context Research",
             config_fields=[
-                PluginConfigField(
-                    name="reddit_user_agent",
-                    field_type="string",
-                    label="Reddit User Agent",
-                    description="User agent for public Reddit JSON requests",
-                    default="DataclawContextResearch/0.1",
-                ),
                 PluginConfigField(
                     name="request_timeout",
                     field_type="int",
