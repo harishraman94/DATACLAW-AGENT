@@ -11,8 +11,6 @@ def summarize_findings(findings: list[dict[str, Any]]) -> dict[str, Any]:
     by_evidence = Counter(f.get("evidence_level", "unverified") for f in findings)
     themes = _theme_findings(findings)
     caveats = []
-    if by_evidence.get("weak", 0):
-        caveats.append("Reddit/forum findings are weak community signals and must be verified against domain sources and the dataset.")
     if not findings:
         caveats.append("No external context findings are currently saved.")
     return {
@@ -59,7 +57,7 @@ tags:
 
 # External Context
 
-These notes collect cited external context for the dataset/problem. Community findings are intentionally labeled as weak evidence and should be verified before they influence analysis decisions.
+These notes collect cited technical context for the dataset/problem. Findings should be verified before they influence analysis decisions.
 
 ## Evidence Summary
 
@@ -86,7 +84,7 @@ def _theme_findings(findings: list[dict[str, Any]]) -> dict[str, list[str]]:
             str(finding.get("title", "")),
             str(finding.get("snippet", "")),
         ]).lower()
-        label = "Community Signals"
+        label = "Technical Context"
         if any(word in text for word in ("privacy", "bias", "ethical", "fairness")):
             label = "Bias / Privacy / Ethics Considerations"
         elif any(word in text for word in ("missing", "quality", "dirty", "null", "outlier")):

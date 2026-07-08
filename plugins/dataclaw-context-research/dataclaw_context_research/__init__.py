@@ -22,7 +22,6 @@ from dataclaw_context_research.tools import (
     context_research_run_parallel_experiments,
     context_research_save_program_to_okf,
     context_research_save_to_okf,
-    context_research_search_reddit,
     context_research_search_sources,
     context_research_summarize_findings,
     set_delegate_to_subagent,
@@ -60,24 +59,8 @@ class ContextResearchPlugin:
                 },
             ),
             (
-                "context_research_search_reddit",
-                "Search Reddit for weak/community context about an open-world data problem",
-                context_research_search_reddit,
-                {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "dataset_id": {"type": "string", "description": "Optional dataset ID to attach findings to", "default": ""},
-                        "problem_statement": {"type": "string", "description": "Optional problem statement", "default": ""},
-                        "limit": {"type": "integer", "description": "Maximum results to fetch", "default": 10},
-                        "subreddit": {"type": "string", "description": "Optional subreddit name", "default": ""},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            (
                 "context_research_search_sources",
-                "Search academic papers, arXiv, GitHub, and optionally Reddit for cited open-world context",
+                "Search arXiv, GitHub repositories, and GitHub issues for cited technical context",
                 context_research_search_sources,
                 {
                     "type": "object",
@@ -87,10 +70,10 @@ class ContextResearchPlugin:
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["semantic_scholar", "arxiv", "github_repositories", "github_issues", "reddit"],
+                                "enum": ["arxiv", "github_repositories", "github_issues"],
                             },
                             "description": "Sources to search",
-                            "default": ["semantic_scholar", "arxiv", "github_repositories"],
+                            "default": ["arxiv", "github_repositories", "github_issues"],
                         },
                         "dataset_id": {"type": "string", "description": "Optional dataset ID to attach findings to", "default": ""},
                         "problem_statement": {"type": "string", "description": "Optional problem statement", "default": ""},
@@ -221,13 +204,6 @@ class ContextResearchPlugin:
                     label="Max Results",
                     description="Maximum external results per search",
                     default=15,
-                ),
-                PluginConfigField(
-                    name="semantic_scholar_api_key",
-                    field_type="string",
-                    label="Semantic Scholar API Key",
-                    description="Optional API key for higher Semantic Scholar rate limits",
-                    default="",
                 ),
                 PluginConfigField(
                     name="github_token",

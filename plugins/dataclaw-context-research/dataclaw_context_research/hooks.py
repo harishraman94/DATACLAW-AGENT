@@ -13,7 +13,7 @@ EXTERNAL_RESEARCH_FIRST_PROMPT = """
 ## External Context Research
 For open-ended data science work, treat external context gathering as the first analytical step, before committing to modeling, validation, or experiment design. Use the context research tools to:
 - generate concept-level queries from the user's problem, dataset descriptions, table names, and schema signals;
-- search high-signal sources such as academic papers, arXiv, reputable technical blogs or maintained repositories, GitHub discussions/issues, and Reddit when available;
+- search high-signal technical sources such as arXiv, maintained GitHub repositories, and GitHub issues;
 - identify useful external data sources, benchmark methods, domain constraints, leakage risks, evaluation protocols, and feature-engineering hypotheses;
 - save durable findings or research programs into OKF when an OKF bundle is available;
 - compare any external-enriched or research-methodology-guided experiments against a provided-data-only baseline;
@@ -27,7 +27,7 @@ RESEARCH_STEP_NAME = "External context and data discovery"
 RESEARCH_STEP_DESCRIPTION = (
     "Before modeling or validation, inspect the available dataset context and run "
     "external research. Generate concept-level queries from the problem and schema, "
-    "search academic/repository/community sources as available, identify useful "
+    "search arXiv, GitHub repository, and GitHub issue sources as available, identify useful "
     "external data candidates and domain constraints, save durable findings to OKF "
     "when possible, translate research methodologies into dataset-safe modeling "
     "choices, require ablations against a provided-data-only baseline, and use "

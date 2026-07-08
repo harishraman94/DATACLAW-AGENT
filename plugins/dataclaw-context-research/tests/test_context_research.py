@@ -8,11 +8,10 @@ import pytest
 
 import dataclaw.config.paths as paths
 from dataclaw_data.registry import create_dataset
-from dataclaw_context_research.academic import parse_arxiv, parse_semantic_scholar
-from dataclaw_context_research.github import parse_github_repositories
+from dataclaw_context_research.academic import parse_arxiv
+from dataclaw_context_research.github import parse_github_issues, parse_github_repositories
 from dataclaw_context_research.query import generate_queries, generate_queries_with_llm
 from dataclaw.providers.llm.provider import TextDeltaEvent, TurnCompleteEvent
-from dataclaw_context_research.reddit import parse_reddit_search, search_reddit
 from dataclaw_context_research.registry import filter_findings, find_program, read_findings
 from dataclaw_context_research.tools import (
     context_research_build_program,
@@ -20,7 +19,6 @@ from dataclaw_context_research.tools import (
     context_research_run_parallel_experiments,
     context_research_save_program_to_okf,
     context_research_save_to_okf,
-    context_research_search_reddit,
     context_research_search_sources,
     context_research_summarize_findings,
     set_delegate_to_subagent,
@@ -164,99 +162,6 @@ async def test_generate_queries_uses_llm_understanding_when_provider_available()
     assert "temporal validation" in joined
 
 
-def test_parse_reddit_search_labels_findings_as_weak_community_evidence():
-    payload = {
-        "data": {
-            "children": [
-                {
-                    "data": {
-                        "title": "Common churn modeling mistakes",
-                        "permalink": "/r/datascience/comments/abc/common_churn_modeling_mistakes/",
-                        "selftext": "Beware leakage from post-cancel fields.",
-                        "subreddit": "datascience",
-                        "author": "analyst",
-                        "score": 42,
-                        "num_comments": 7,
-                        "created_utc": 1_700_000_000,
-                    }
-                }
-            ]
-        }
-    }
-
-    findings = parse_reddit_search(payload, query="customer churn common pitfalls")
-
-    assert len(findings) == 1
-    finding = findings[0]
-    assert finding["source"] == "reddit"
-    assert finding["source_type"] == "community_discussion"
-    assert finding["evidence_level"] == "weak"
-    assert finding["url"].startswith("https://www.reddit.com/")
-    assert "unverified" in finding["tags"]
-
-
-@pytest.mark.asyncio
-async def test_public_reddit_search_uses_json_endpoint(monkeypatch):
-    calls = []
-
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"data": {"children": []}}
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            calls.append({"init": kwargs})
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def get(self, url, *, params):
-            calls.append({"url": url, "params": params})
-            return FakeResponse()
-
-    monkeypatch.setattr("dataclaw_context_research.reddit.httpx.AsyncClient", FakeClient)
-
-    await search_reddit(query="student performance")
-
-    assert calls[0]["init"]["headers"] == {"User-Agent": "DataclawContextResearch/0.1"}
-    assert calls[1]["url"] == "https://www.reddit.com/search.json"
-
-
-def test_parse_semantic_scholar_normalizes_papers_as_strong_evidence():
-    payload = {
-        "data": [
-            {
-                "paperId": "abc",
-                "title": "Customer churn prediction survey",
-                "abstract": "A review of churn prediction methods.",
-                "authors": [{"name": "Ada Analyst"}],
-                "year": 2025,
-                "venue": "Journal of Data Mining",
-                "url": "https://www.semanticscholar.org/paper/abc",
-                "citationCount": 12,
-                "isOpenAccess": True,
-                "externalIds": {"DOI": "10.123/example"},
-            }
-        ]
-    }
-
-    findings = parse_semantic_scholar(payload, query="customer churn prediction")
-
-    assert len(findings) == 1
-    finding = findings[0]
-    assert finding["source"] == "semantic_scholar"
-    assert finding["source_type"] == "paper"
-    assert finding["evidence_level"] == "strong"
-    assert finding["authors"] == ["Ada Analyst"]
-    assert finding["citation_count"] == 12
-
-
 def test_parse_arxiv_normalizes_preprints_as_medium_evidence():
     feed = """<?xml version="1.0" encoding="UTF-8"?>
     <feed xmlns="http://www.w3.org/2005/Atom">
@@ -305,36 +210,29 @@ def test_parse_github_repositories_normalizes_repos_as_medium_evidence():
     assert finding["stars"] == 100
 
 
-@pytest.mark.asyncio
-async def test_search_reddit_persists_mocked_findings(monkeypatch, survey_dataset):
-    async def fake_search_reddit(**kwargs):
-        return [
+def test_parse_github_issues_normalizes_issues_as_medium_evidence():
+    payload = {
+        "items": [
             {
-                "query": kwargs["query"],
-                "source": "reddit",
-                "source_type": "community_discussion",
-                "evidence_level": "weak",
-                "title": "Survey data quality issue",
-                "url": "https://www.reddit.com/r/analytics/comments/1/survey/",
-                "snippet": "NPS comments can be biased toward extreme respondents.",
-                "tags": ["community_signal", "unverified"],
-                "accepted_for_okf": False,
+                "title": "Leakage in churn benchmark",
+                "html_url": "https://github.com/example/churn-model/issues/12",
+                "body": "The benchmark includes labels leaked into feature columns.",
+                "state": "open",
+                "comments": 4,
+                "updated_at": "2026-01-02T00:00:00Z",
             }
         ]
+    }
 
-    monkeypatch.setattr("dataclaw_context_research.tools.search_reddit", fake_search_reddit)
+    findings = parse_github_issues(payload, query="churn leakage")
 
-    result = await context_research_search_reddit(
-        query="customer survey nps bias",
-        dataset_id=survey_dataset["id"],
-        problem_statement="Understand churn from survey responses",
-    )
-
-    assert result["status"] == "saved"
-    assert result["saved_count"] == 1
-    findings = filter_findings(dataset_id=survey_dataset["id"])
     assert len(findings) == 1
-    assert findings[0]["problem_statement"] == "Understand churn from survey responses"
+    finding = findings[0]
+    assert finding["source"] == "github"
+    assert finding["source_type"] == "code_repository"
+    assert finding["evidence_level"] == "medium"
+    assert finding["comments"] == 4
+    assert "issue" in finding["tags"]
 
 
 @pytest.mark.asyncio
@@ -344,8 +242,8 @@ async def test_search_sources_persists_mixed_provider_findings(monkeypatch, surv
             {
                 "query": query,
                 "source": source,
-                "source_type": "paper" if source == "semantic_scholar" else "code_repository",
-                "evidence_level": "strong" if source == "semantic_scholar" else "medium",
+                "source_type": "paper" if source == "arxiv" else "code_repository",
+                "evidence_level": "medium",
                 "title": f"{source} result",
                 "url": f"https://example.com/{source}",
                 "snippet": "Useful external context.",
@@ -358,41 +256,45 @@ async def test_search_sources_persists_mixed_provider_findings(monkeypatch, surv
 
     result = await context_research_search_sources(
         query="customer churn data quality",
-        sources=["semantic_scholar", "github_repositories"],
+        sources=["arxiv", "github_repositories", "github_issues"],
         dataset_id=survey_dataset["id"],
     )
 
     assert result["status"] == "saved"
-    assert result["saved_count"] == 2
+    assert result["saved_count"] == 3
     assert not result["errors"]
     findings = filter_findings(dataset_id=survey_dataset["id"])
-    assert {f["evidence_level"] for f in findings} == {"strong", "medium"}
+    assert {f["source"] for f in findings} == {"arxiv", "github_repositories", "github_issues"}
+    assert {f["evidence_level"] for f in findings} == {"medium"}
 
 
 @pytest.mark.asyncio
 async def test_summarize_and_save_findings_to_okf(monkeypatch, survey_dataset):
-    async def fake_search_reddit(**kwargs):
+    async def fake_search_one_source(source, *, query, limit, timeout):
         return [
             {
-                "query": kwargs["query"],
-                "source": "reddit",
-                "source_type": "community_discussion",
-                "evidence_level": "weak",
+                "query": query,
+                "source": "github",
+                "source_type": "code_repository",
+                "evidence_level": "medium",
                 "title": "Churn leakage warning",
-                "url": "https://www.reddit.com/r/datascience/comments/2/churn/",
+                "url": "https://github.com/example/churn-model/issues/2",
                 "snippet": "Watch for leakage from fields created after cancellation.",
-                "tags": ["community_signal", "unverified"],
+                "tags": ["code_repository", "issue"],
                 "accepted_for_okf": False,
             }
         ]
 
-    monkeypatch.setattr("dataclaw_context_research.tools.search_reddit", fake_search_reddit)
-    await context_research_search_reddit(query="churn leakage pitfalls", dataset_id=survey_dataset["id"])
+    monkeypatch.setattr("dataclaw_context_research.tools._search_one_source", fake_search_one_source)
+    await context_research_search_sources(
+        query="churn leakage pitfalls",
+        sources=["github_issues"],
+        dataset_id=survey_dataset["id"],
+    )
 
     summary = await context_research_summarize_findings(dataset_id=survey_dataset["id"])
     assert summary["count"] == 1
-    assert summary["evidence_levels"]["weak"] == 1
-    assert summary["caveats"]
+    assert summary["evidence_levels"]["medium"] == 1
 
     bundle = generate_bundle(survey_dataset["id"])
     saved = await context_research_save_to_okf(bundle_id=bundle["id"], dataset_id=survey_dataset["id"])
@@ -401,30 +303,34 @@ async def test_summarize_and_save_findings_to_okf(monkeypatch, survey_dataset):
     external_context = Path(bundle["path"]) / "notes" / "external_context.md"
     text = external_context.read_text(encoding="utf-8")
     assert "External Context" in text
-    assert "weak" in text
+    assert "medium" in text
     assert "Churn leakage warning" in text
     assert read_findings()[0]["accepted_for_okf"] is True
 
 
 @pytest.mark.asyncio
 async def test_build_research_program_creates_hypotheses_and_experiment_tasks(monkeypatch, survey_dataset):
-    async def fake_search_reddit(**kwargs):
+    async def fake_search_one_source(source, *, query, limit, timeout):
         return [
             {
-                "query": kwargs["query"],
-                "source": "semantic_scholar",
+                "query": query,
+                "source": "arxiv",
                 "source_type": "paper",
-                "evidence_level": "strong",
+                "evidence_level": "medium",
                 "title": "Feature engineering for churn prediction",
-                "url": "https://example.com/paper",
+                "url": "https://arxiv.org/abs/2501.00001",
                 "snippet": "Feature engineering and temporal validation improve churn prediction.",
-                "tags": ["academic"],
+                "tags": ["academic", "preprint"],
                 "accepted_for_okf": False,
             }
         ]
 
-    monkeypatch.setattr("dataclaw_context_research.tools.search_reddit", fake_search_reddit)
-    await context_research_search_reddit(query="churn feature engineering", dataset_id=survey_dataset["id"])
+    monkeypatch.setattr("dataclaw_context_research.tools._search_one_source", fake_search_one_source)
+    await context_research_search_sources(
+        query="churn feature engineering",
+        sources=["arxiv"],
+        dataset_id=survey_dataset["id"],
+    )
 
     program = await context_research_build_program(
         dataset_id=survey_dataset["id"],
@@ -433,7 +339,16 @@ async def test_build_research_program_creates_hypotheses_and_experiment_tasks(mo
 
     assert program["id"].startswith("program-")
     assert program["hypotheses"]
+    first_hypothesis = program["hypotheses"][0]
+    assert first_hypothesis["source_attribution"]["title"] == "Feature engineering for churn prediction"
+    assert first_hypothesis["source_attribution"]["url"] == "https://arxiv.org/abs/2501.00001"
+    assert first_hypothesis["source_attribution"]["evidence_level"] == "medium"
+    assert "Matched because" in first_hypothesis["problem_match"]
+    assert "churn" in first_hypothesis["problem_match"].lower()
+    assert "https://arxiv.org/abs/2501.00001" in str(first_hypothesis)
     assert program["methodology_translations"]
+    assert program["methodology_translations"][0]["source_attribution"]["url"] == "https://arxiv.org/abs/2501.00001"
+    assert "Matched because" in program["methodology_translations"][0]["problem_match"]
     assert program["ablation_plan"]
     assert program["external_data_candidates"]
     assert program["experiment_branches"]
@@ -451,6 +366,28 @@ async def test_build_research_program_creates_hypotheses_and_experiment_tasks(mo
 
 @pytest.mark.asyncio
 async def test_save_research_program_to_okf(monkeypatch, survey_dataset):
+    async def fake_search_one_source(source, *, query, limit, timeout):
+        return [
+            {
+                "query": query,
+                "source": "github",
+                "source_type": "code_repository",
+                "evidence_level": "medium",
+                "title": "Survey churn feature engineering",
+                "url": "https://github.com/example/churn-model",
+                "snippet": "Churn analysis benefits from survey satisfaction features and leakage-safe validation.",
+                "tags": ["code_repository", "implementation"],
+                "accepted_for_okf": False,
+            }
+        ]
+
+    monkeypatch.setattr("dataclaw_context_research.tools._search_one_source", fake_search_one_source)
+    await context_research_search_sources(
+        query="survey churn feature engineering",
+        sources=["github_repositories"],
+        dataset_id=survey_dataset["id"],
+    )
+
     program = await context_research_build_program(
         dataset_id=survey_dataset["id"],
         problem_statement="Improve survey churn analysis.",
@@ -465,6 +402,9 @@ async def test_save_research_program_to_okf(monkeypatch, survey_dataset):
     assert result["path"] == "notes/research_program.md"
     text = (Path(bundle["path"]) / "notes" / "research_program.md").read_text(encoding="utf-8")
     assert "Research Program" in text
+    assert "https://github.com/example/churn-model" in text
+    assert "Problem match" in text
+    assert "Matched because" in text
     assert "Methodology Translations" in text
     assert "Ablation Plan" in text
     assert "Experiment Branches" in text

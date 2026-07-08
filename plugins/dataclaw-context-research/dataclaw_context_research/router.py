@@ -15,7 +15,6 @@ from dataclaw_context_research.tools import (
     context_research_run_parallel_experiments,
     context_research_save_program_to_okf,
     context_research_save_to_okf,
-    context_research_search_reddit,
     context_research_search_sources,
     context_research_summarize_findings,
 )
@@ -27,14 +26,6 @@ class QueryRequest(BaseModel):
     dataset_id: str = ""
     problem_statement: str = ""
     limit: int = 8
-
-
-class RedditSearchRequest(BaseModel):
-    query: str
-    dataset_id: str = ""
-    problem_statement: str = ""
-    limit: int = 10
-    subreddit: str = ""
 
 
 class SourceSearchRequest(BaseModel):
@@ -79,17 +70,6 @@ async def generate_queries_route(req: QueryRequest) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-
-
-@router.post("/reddit/search")
-async def search_reddit_route(req: RedditSearchRequest) -> dict[str, Any]:
-    return await context_research_search_reddit(
-        query=req.query,
-        dataset_id=req.dataset_id,
-        problem_statement=req.problem_statement,
-        limit=req.limit,
-        subreddit=req.subreddit,
-    )
 
 
 @router.post("/sources/search")

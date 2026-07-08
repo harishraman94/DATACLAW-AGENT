@@ -154,10 +154,23 @@ def _hypotheses(
             title = finding.get("title", "external finding")
             source = finding.get("source", "external")
             evidence = finding.get("evidence_level", "unverified")
+            source_attribution = _source_attribution(finding)
+            problem_match = _problem_match_description(
+                finding=finding,
+                problem_statement=problem_statement,
+                schema_terms=schema_terms,
+                target=target,
+            )
             base.append({
                 "id": f"h{len(base) + 1}",
                 "statement": f"Insights from '{title}' may improve the solution if adapted to this dataset.",
                 "rationale": f"Source: {source}, evidence: {evidence}. Use as a testable hypothesis, not an assumption.",
+                "source_attribution": source_attribution,
+                "problem_match": problem_match,
+                "chat_summary": (
+                    f"{source_attribution['label']} suggests a testable direction for this problem. "
+                    f"{problem_match}"
+                ),
                 "signals_to_test": _signals_from_text(f"{title} {finding.get('snippet', '')}", schema_terms),
                 "expected_effect": "Potential lift over provided-data-only baseline if the idea captures missing domain structure.",
                 "risk": "May not transfer; validate with ablation and leakage checks.",
@@ -171,6 +184,8 @@ def _hypotheses(
                 "id": f"h{len(base) + 1}",
                 "statement": "Temporal/order-aware features may improve performance if observations have sequence or recency structure.",
                 "rationale": "Many real-world problems encode behavior over time even when raw rows look static.",
+                "problem_match": "This is a general fallback hypothesis derived from the problem shape and schema, not a specific external source.",
+                "source_attribution": {},
                 "signals_to_test": ["lag/rolling aggregates", "session order", "recency"],
                 "expected_effect": "Better generalization for behavior or forecasting tasks.",
                 "risk": "High leakage risk if future information is included.",
@@ -180,6 +195,8 @@ def _hypotheses(
                 "id": f"h{len(base) + 2}",
                 "statement": "External domain covariates may explain variance missing from the provided dataset.",
                 "rationale": "Provided data is often an incomplete view of the real-world system.",
+                "problem_match": "This is a general fallback hypothesis derived from the problem shape and schema, not a specific external source.",
+                "source_attribution": {},
                 "signals_to_test": ["public statistics", "calendar effects", "geographic or market context"],
                 "expected_effect": "Improved robustness on scenarios underrepresented in training data.",
                 "risk": "External joins can introduce coverage bias or stale context.",
@@ -229,6 +246,8 @@ def _methodology_translations(hypotheses: list[dict[str, Any]]) -> list[dict[str
             "id": f"m-{hypothesis['id']}",
             "hypothesis_id": hypothesis["id"],
             "research_idea": hypothesis["statement"],
+            "source_attribution": hypothesis.get("source_attribution", {}),
+            "problem_match": hypothesis.get("problem_match", ""),
             "dataset_safe_translation": (
                 "Translate the research idea into features, preprocessing, validation choices, "
                 "or model constraints that can be derived from the provided dataset before trying external joins."
@@ -408,6 +427,52 @@ def _source_summary(findings: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _source_attribution(finding: dict[str, Any]) -> dict[str, Any]:
+    title = str(finding.get("title") or "External finding").strip()
+    source = str(finding.get("source") or "external").strip()
+    evidence = str(finding.get("evidence_level") or "unverified").strip()
+    source_type = str(finding.get("source_type") or "source").strip()
+    year = finding.get("year")
+    label_parts = [title, f"{source}/{source_type}", f"evidence: {evidence}"]
+    if year:
+        label_parts.insert(1, str(year))
+    return {
+        "finding_id": finding.get("id", ""),
+        "title": title,
+        "url": finding.get("url", ""),
+        "source": source,
+        "source_type": source_type,
+        "evidence_level": evidence,
+        "label": " | ".join(label_parts),
+        "short_description": _compact_sentence(str(finding.get("snippet") or ""), limit=220),
+    }
+
+
+def _problem_match_description(
+    *,
+    finding: dict[str, Any],
+    problem_statement: str,
+    schema_terms: list[str],
+    target: str,
+) -> str:
+    text = f"{finding.get('title', '')} {finding.get('snippet', '')}".lower()
+    problem_terms = _tokens(problem_statement)
+    matched_problem_terms = [term for term in problem_terms if term in text][:5]
+    matched_schema_terms = [term for term in schema_terms if term and term.lower() in text][:5]
+    parts = []
+    if target and target.lower() in text:
+        parts.append(f"it references the target/context `{target}`")
+    if matched_problem_terms:
+        parts.append(f"it overlaps with problem terms `{matched_problem_terms}`")
+    if matched_schema_terms:
+        parts.append(f"it maps to dataset/schema signals `{matched_schema_terms}`")
+    if not parts:
+        source_type = finding.get("source_type", "source")
+        evidence = finding.get("evidence_level", "unverified")
+        parts.append(f"it is a {evidence} {source_type} result from the external context search for this problem")
+    return "Matched because " + "; ".join(parts) + "."
+
+
 def _signals_from_text(text: str, schema_terms: list[str]) -> list[str]:
     lower = text.lower()
     hits = [term for term in schema_terms if term and term.lower() in lower]
@@ -422,6 +487,13 @@ def _tokens(text: str) -> list[str]:
     return [t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if len(t) > 3 and t not in stop]
 
 
+def _compact_sentence(text: str, *, limit: int = 220) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
 def _dict_lines(values: dict[str, Any]) -> str:
     return "\n".join(f"- {k}: `{v}`" for k, v in values.items()) or "- None"
 
@@ -431,6 +503,19 @@ def _hypothesis_lines(items: list[dict[str, Any]]) -> str:
     for item in items:
         lines.append(f"### {item.get('id')}: {item.get('statement')}")
         lines.append(f"- Rationale: {item.get('rationale')}")
+        source = item.get("source_attribution") or {}
+        if source:
+            url = source.get("url") or ""
+            title = source.get("title") or "External source"
+            source_label = f"[{title}]({url})" if url else title
+            lines.append(
+                f"- Source: {source_label} ({source.get('source')}/{source.get('source_type')}, "
+                f"evidence: {source.get('evidence_level')})"
+            )
+            if source.get("short_description"):
+                lines.append(f"- Source context: {source.get('short_description')}")
+        if item.get("problem_match"):
+            lines.append(f"- Problem match: {item.get('problem_match')}")
         lines.append(f"- Signals to test: `{item.get('signals_to_test', [])}`")
         lines.append(f"- Expected effect: {item.get('expected_effect')}")
         lines.append(f"- Risk: {item.get('risk')}\n")
@@ -448,6 +533,11 @@ def _methodology_lines(items: list[dict[str, Any]]) -> str:
     lines = []
     for item in items:
         lines.append(f"### {item.get('id')}: {item.get('research_idea')}")
+        source = item.get("source_attribution") or {}
+        if source:
+            lines.append(f"- Source: {source.get('label')}")
+        if item.get("problem_match"):
+            lines.append(f"- Problem match: {item.get('problem_match')}")
         lines.append(f"- Dataset-safe translation: {item.get('dataset_safe_translation')}")
         lines.append(f"- Candidate methods: `{item.get('candidate_methods', [])}`")
         lines.append(f"- Baseline comparison: {item.get('baseline_comparison')}")

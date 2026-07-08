@@ -7,11 +7,10 @@ from typing import Any
 
 import asyncio
 
-from dataclaw_context_research.academic import search_arxiv, search_semantic_scholar
+from dataclaw_context_research.academic import search_arxiv
 from dataclaw_context_research.github import search_github_issues, search_github_repositories
 from dataclaw_context_research.program import build_research_program, program_markdown
 from dataclaw_context_research.query import generate_queries_with_llm
-from dataclaw_context_research.reddit import search_reddit
 from dataclaw_context_research.registry import (
     filter_findings,
     filter_programs,
@@ -59,53 +58,6 @@ async def context_research_generate_queries(
     )
 
 
-async def context_research_search_reddit(
-    *,
-    query: str,
-    dataset_id: str = "",
-    problem_statement: str = "",
-    limit: int = 10,
-    subreddit: str = "",
-    **kwargs: Any,
-) -> dict[str, Any]:
-    max_results = int(_plugin_cfg.get("max_results", 15) or 15)
-    effective_limit = min(max(1, int(limit)), max_results)
-    try:
-        findings = await search_reddit(
-            query=query,
-            limit=effective_limit,
-            subreddit=subreddit,
-            user_agent=str(_plugin_cfg.get("reddit_user_agent") or "DataclawContextResearch/0.1"),
-            timeout=int(_plugin_cfg.get("request_timeout", 12) or 12),
-        )
-    except Exception as exc:
-        return {
-            "status": "error",
-            "error": str(exc),
-            "query": query,
-            "source": "reddit",
-            "saved_count": 0,
-        }
-
-    enriched = []
-    for finding in findings:
-        enriched.append({
-            **finding,
-            "dataset_id": dataset_id,
-            "problem_statement": problem_statement,
-        })
-    saved = save_findings(enriched)
-    return {
-        "status": "saved",
-        "query": query,
-        "source": "reddit",
-        "evidence_level": "weak",
-        "saved_count": len(saved),
-        "findings": [_summarize_finding(f) for f in saved],
-        "note": "Reddit findings are weak community signals. Verify before using them as analysis assumptions.",
-    }
-
-
 async def context_research_search_sources(
     *,
     query: str,
@@ -116,7 +68,7 @@ async def context_research_search_sources(
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Search multiple external source providers and persist normalized findings."""
-    selected = sources or ["semantic_scholar", "arxiv", "github_repositories"]
+    selected = sources or ["arxiv", "github_repositories", "github_issues"]
     max_results = int(_plugin_cfg.get("max_results", 15) or 15)
     effective_limit = min(max(1, int(limit)), max_results)
     timeout = int(_plugin_cfg.get("request_timeout", 12) or 12)
@@ -143,7 +95,7 @@ async def context_research_search_sources(
         "saved_count": len(saved),
         "errors": errors,
         "findings": [_summarize_finding(f) for f in saved],
-        "note": "Findings are normalized and evidence-labeled. Verify medium/weak sources before using them as assumptions.",
+        "note": "Findings are normalized and evidence-labeled. Verify external sources before using them as assumptions.",
     }
 
 
@@ -196,7 +148,7 @@ async def context_research_save_to_okf(
         "bundle_id": bundle_id,
         "path": "notes/external_context.md",
         "saved_findings": len(findings),
-        "evidence_note": "External context is cited and evidence-labeled; weak/community findings require verification.",
+        "evidence_note": "External context is cited and evidence-labeled; verify technical findings against the dataset before relying on them.",
     }
 
 
@@ -300,7 +252,6 @@ def _summarize_finding(finding: dict[str, Any]) -> dict[str, Any]:
         "title": finding.get("title"),
         "url": finding.get("url"),
         "snippet": finding.get("snippet", ""),
-        "subreddit": finding.get("subreddit", ""),
         "score": finding.get("score", 0),
         "comment_count": finding.get("comment_count", 0),
         "authors": finding.get("authors", []),
@@ -341,13 +292,6 @@ async def _search_one_source(
     timeout: int,
 ) -> list[dict[str, Any]]:
     source_key = source.strip().lower().replace("-", "_")
-    if source_key in {"semantic_scholar", "semanticscholar", "papers"}:
-        return await search_semantic_scholar(
-            query=query,
-            limit=limit,
-            timeout=timeout,
-            api_key=str(_plugin_cfg.get("semantic_scholar_api_key") or ""),
-        )
     if source_key in {"arxiv", "preprints"}:
         return await search_arxiv(query=query, limit=limit, timeout=timeout)
     if source_key in {"github", "github_repositories", "repos", "repositories"}:
@@ -363,12 +307,5 @@ async def _search_one_source(
             limit=limit,
             timeout=timeout,
             token=str(_plugin_cfg.get("github_token") or ""),
-        )
-    if source_key == "reddit":
-        return await search_reddit(
-            query=query,
-            limit=limit,
-            user_agent=str(_plugin_cfg.get("reddit_user_agent") or "DataclawContextResearch/0.1"),
-            timeout=timeout,
         )
     raise ValueError(f"Unsupported context research source: {source}")
