@@ -63,3 +63,6 @@ class AgentState(TypedDict, total=False):
     turn: int
     max_turns: int
     metadata: dict[str, Any]
+    # Per-turn reasoning budget (minimal|low|medium|high). Set by upstream
+    # nodes/hooks for turns that warrant deeper thinking, e.g. plan drafting.
+    reasoning_effort: str

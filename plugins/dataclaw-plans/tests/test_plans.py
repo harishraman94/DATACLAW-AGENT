@@ -13,7 +13,7 @@ from dataclaw_plans.store import (
     SNAPSHOTS_PER_PROPOSAL,
 )
 from dataclaw_plans.tools import propose_plan, update_plan, get_plan_decision, list_plans, get_plan
-from dataclaw_plans.hooks import active_plan_context_hook
+from dataclaw_plans.hooks import active_plan_context_hook, planning_reasoning_hook
 from dataclaw_plans.gates import accept_gate_risk, get_plan_gates, set_step_gate
 from dataclaw_plans.mlflow_tools import (
     _client,
@@ -680,6 +680,32 @@ async def test_hook_injects_session_id():
     }
     updated = await active_plan_context_hook(state)
     assert updated["pending_tool_calls"][0]["tool_input"]["session_id"] == "real-sess"
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_elevates_while_drafting_then_stops():
+    """Reasoning is elevated through the planning/approval phase, off during execution."""
+    sid = "sess-1"
+    state = {"session_id": sid}
+
+    # Pre-plan (EDA + drafting turn): elevated.
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "medium"
+
+    # Drafted but awaiting approval (covers revisions): still elevated.
+    r = await propose_plan(
+        name="P", description="d", steps=[{"name": "s", "description": "d"}],
+        plan_markdown="# Plan\n\n## QA\nCheck counts.", session_id=sid,
+    )
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "medium"
+
+    # Approved → execution phase → not elevated.
+    await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
+    assert "reasoning_effort" not in await planning_reasoning_hook(dict(state))
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_ignores_missing_session():
+    assert "reasoning_effort" not in await planning_reasoning_hook({"session_id": ""})
 
 
 @pytest.mark.asyncio

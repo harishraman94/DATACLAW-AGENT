@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator
 
-from dataclaw.config.resolver import resolve
 from dataclaw.providers.agent.provider import AgentProvider, ConfigField
 from dataclaw.providers.llm.provider import BrokerEvent, LLMProvider
 from dataclaw.state import AgentState
@@ -18,16 +17,8 @@ from dataclaw.state import AgentState
 class LangChainAgentProvider:
     """Agent provider that delegates to an LLMProvider."""
 
-    def __init__(self, llm: LLMProvider, reasoning_effort: str | None = None) -> None:
+    def __init__(self, llm: LLMProvider) -> None:
         self._llm = llm
-        # Reasoning budget for every main-loop turn (plan drafting included, which
-        # is otherwise emitted at the model default of none). Resolved from config
-        # when not passed explicitly; empty/None leaves the model unchanged.
-        self._reasoning_effort = (
-            reasoning_effort
-            if reasoning_effort is not None
-            else resolve("llm.reasoning_effort", "DATACLAW_LLM_REASONING_EFFORT", "")
-        ) or None
 
     @classmethod
     def config_schema(cls) -> list[ConfigField]:
@@ -71,8 +62,12 @@ class LangChainAgentProvider:
         system_dynamic = state.get("system_prompt_dynamic", "")
         if system_dynamic:
             extra_kwargs["system_dynamic"] = system_dynamic
-        if self._reasoning_effort:
-            extra_kwargs["reasoning_effort"] = self._reasoning_effort
+        # Per-turn reasoning budget. Set by upstream nodes/hooks for turns that
+        # warrant deeper thinking (e.g. the plans plugin elevates it while a plan
+        # is being drafted). Unset on ordinary turns leaves the model at default.
+        reasoning_effort = state.get("reasoning_effort")
+        if reasoning_effort:
+            extra_kwargs["reasoning_effort"] = reasoning_effort
 
         async for event in self._llm.stream_turn(
             messages, system=system, tools=tools, **extra_kwargs

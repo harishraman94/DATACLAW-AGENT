@@ -12,7 +12,7 @@ from dataclaw.providers.tool.implementations.python_tool import PythonTool
 from dataclaw_plans.tools import propose_plan, update_plan, list_plans, get_plan, accept_gate_risk
 from dataclaw_plans.mlflow_tools import query_mlflow_runs
 from dataclaw_plans.router import router as plans_router, mlflow_router
-from dataclaw_plans.hooks import active_plan_context_hook
+from dataclaw_plans.hooks import active_plan_context_hook, planning_reasoning_hook
 from dataclaw_plans.gates import GateRiskAcceptanceGuardrail
 
 
@@ -27,6 +27,8 @@ class PlansPlugin:
 
         # Register hooks
         ctx.hooks.register("preToolCallHook", active_plan_context_hook)
+        # Runs right before the agent turn: elevates reasoning while drafting a plan.
+        ctx.hooks.register("postToolAvailabilityHook", planning_reasoning_hook)
         if ctx.guardrail_registry is not None:
             ctx.guardrail_registry.register(GateRiskAcceptanceGuardrail())
         if ctx.session_cleanup_registry is not None:
@@ -53,10 +55,17 @@ class PlansPlugin:
                         "type": "string",
                         "description": (
                             "Required detailed Markdown review document for plan.md — the substance a lead reviews, "
-                            "richer than the compact steps. Must cover: objective; what is already known from prior "
-                            "inspection (cite the initial hypothesis ledger from propose_eda_hypotheses); assumptions "
-                            "and data limitations; grouped workstreams; validation and QA checks; expected "
-                            "deliverables; risks or open questions; and execution order. Do not leave this empty."
+                            "richer than the compact steps. Must cover: objective and what is already known from prior "
+                            "inspection (cite the initial hypothesis ledger from propose_eda_hypotheses); method and "
+                            "rationale (the analytical approach chosen for the question type and data shape, with the "
+                            "main alternatives considered and rejected — e.g. a causal design vs a predictive model); "
+                            "assumptions, data limitations, and threats to validity with how each is controlled "
+                            "(leakage, confounding, selection bias, non-stationarity, multiple comparisons, "
+                            "insufficient statistical power); the baseline and success threshold the analysis must "
+                            "beat plus the evaluation protocol appropriate to the data (e.g. time-based or group-aware "
+                            "splits to avoid leakage); grouped workstreams; explicit out-of-scope / non-goals; "
+                            "validation and QA checks; expected deliverables; risks or open questions; and execution "
+                            "order. Do not leave this empty."
                         ),
                     },
                     "steps": {
