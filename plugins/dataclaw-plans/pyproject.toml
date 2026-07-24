@@ -5,7 +5,7 @@ description = "Dataclaw plugin — plan proposal system and MLflow experiment tr
 requires-python = ">=3.12"
 dependencies = [
     "dataclaw",
-    "mlflow>=2.0",
+    "mlflow==3.14.0",
 ]
 
 [project.entry-points."dataclaw.plugins"]

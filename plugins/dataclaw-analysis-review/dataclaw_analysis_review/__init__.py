@@ -23,6 +23,13 @@ class AnalysisReviewPlugin:
         ctx.hooks.register("preToolCallHook", review_context_hook)
         ctx.hooks.register("postToolCallHook", auto_review_completed_steps_hook)
         ctx.hooks.register("postToolCallHook", surface_unreviewed_publish_hook)
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_analysis_review.store import delete_session_records
+
+            ctx.session_cleanup_registry.register(
+                "analysis_review",
+                lambda session: delete_session_records(str(session.get("id") or "")),
+            )
 
         try:
             from dataclaw_plans.gates import register_gate_resolver

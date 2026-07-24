@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -63,6 +64,15 @@ def events_file(session_id: str | None = "default") -> Path:
     path = review_root() / safe_session_id(session_id) / "review_events.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def delete_session_records(session_id: str) -> dict[str, Any]:
+    """Delete the analysis-review ledger directory owned by one session."""
+    path = workspaces_dir() / "analysis-review" / safe_session_id(session_id)
+    existed = path.exists()
+    if existed:
+        shutil.rmtree(path)
+    return {"removed": existed}
 
 
 def _path_lock(path: Path) -> threading.Lock:

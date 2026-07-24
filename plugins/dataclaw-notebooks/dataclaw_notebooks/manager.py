@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from typing import Any
 
 import nbformat
 from jupyter_client import AsyncKernelManager
+
+from dataclaw.mlflow_compat import MLFLOW_REQUIREMENT, MLFLOW_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -291,12 +294,66 @@ class NotebookManager:
             return venv / "Scripts" / "python.exe"
         return venv / "bin" / "python"
 
+    @staticmethod
+    def _uv_command() -> list[str]:
+        """Use the uv executable when available, otherwise its Python module."""
+        if shutil.which("uv"):
+            return ["uv"]
+        return [sys.executable, "-m", "uv"]
+
+    @staticmethod
+    def _installed_mlflow_version(python: Path) -> str:
+        result = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "from importlib.metadata import version; print(version('mlflow'))",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _ensure_managed_mlflow(self, python: Path) -> None:
+        """Keep an existing DataClaw-managed kernel aligned with the host schema."""
+        installed = self._installed_mlflow_version(python)
+        if installed == MLFLOW_VERSION:
+            return
+
+        logger.info(
+            "Updating managed kernel MLflow from %s to %s",
+            installed or "missing",
+            MLFLOW_VERSION,
+        )
+        subprocess.run(
+            [
+                *self._uv_command(),
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                MLFLOW_REQUIREMENT,
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        resolved = self._installed_mlflow_version(python)
+        if resolved != MLFLOW_VERSION:
+            raise RuntimeError(
+                "Managed notebook environment has an incompatible MLflow version: "
+                f"expected {MLFLOW_VERSION}, found {resolved or 'missing'}"
+            )
+
     def _ensure_venv(self, packages: list[str] | None = None, python_version: str = "") -> Path | None:
         """Create the project venv if it doesn't exist. Install specified packages via uv."""
         venv = self._venv_dir()
         python = self._venv_python()
 
         if python.exists():
+            self._ensure_managed_mlflow(python)
             return python
 
         if packages is None:
@@ -307,32 +364,38 @@ class NotebookManager:
                 packages = [
                     "ipykernel", "nbformat>=4.2.0", "pandas", "numpy",
                     "matplotlib", "seaborn", "scikit-learn", "scipy",
-                    "plotly", "duckdb", "requests", "mlflow",
+                    "plotly", "duckdb", "requests", MLFLOW_REQUIREMENT,
                 ]
 
-        # Ensure required packages are always included
+        # Ensure required packages are always included and canonicalized.
         try:
-            from dataclaw_projects.registry import REQUIRED_PACKAGES
-            for pkg in REQUIRED_PACKAGES:
-                if pkg not in packages:
-                    packages.append(pkg)
+            from dataclaw_projects.registry import ensure_required_packages
+            packages = ensure_required_packages(packages)
         except ImportError:
-            if "ipykernel" not in packages:
-                packages = ["ipykernel"] + packages
+            packages = [
+                "ipykernel",
+                MLFLOW_REQUIREMENT,
+                *[
+                    pkg for pkg in packages
+                    if not pkg.startswith("ipykernel")
+                    and not pkg.lower().startswith("mlflow")
+                ],
+            ]
 
         logger.info("Creating isolated venv for '%s' at %s with %d packages", self._project_id, venv, len(packages))
         try:
-            venv_cmd = ["uv", "venv", str(venv)]
+            venv_cmd = [*self._uv_command(), "venv", str(venv)]
             if python_version:
                 venv_cmd += ["--python", python_version]
 
             subprocess.run(venv_cmd, check=True, capture_output=True, timeout=60)
 
             subprocess.run(
-                ["uv", "pip", "install", "--python", str(python)] + packages,
+                [*self._uv_command(), "pip", "install", "--python", str(python)] + packages,
                 check=True, capture_output=True, timeout=300,
             )
 
+            self._ensure_managed_mlflow(python)
             logger.info("Venv ready for '%s': %s", self._project_id, ", ".join(packages))
             return python
 

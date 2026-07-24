@@ -71,6 +71,14 @@ async def test_agent_turn_limit_is_persisted_and_streamed(
     assert "RUN_FINISHED" in encoded_events
     assert run.status == "finished"
 
+    receipt = stored["capabilityReceipts"][0]
+    assert receipt["runId"] == run_id
+    assert receipt["status"] == "completed"
+    assert receipt["reason"] == "max_turns"
+    assert receipt["tools"]["offered"] == [{"name": "echo", "source": "builtin"}]
+    assert receipt["tools"]["used"][0]["callId"] == "call-1"
+    assert receipt["outputs"][0]["messageId"] == "tc-call-1"
+
 
 def test_run_notice_replays_after_trailing_tools_but_stays_out_of_llm_context():
     raw = [

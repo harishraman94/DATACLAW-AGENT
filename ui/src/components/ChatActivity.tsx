@@ -423,7 +423,10 @@ function stepLabel(call: ToolCallState, now: number = Date.now()): string {
     case 'data_describe_column': return `Described ${args.column_name || 'a column'} in ${dataTarget(args)}${suffix}`
     case 'data_query_data': return `Queried ${dataTarget(args)}${args.sql ? ` — ${compactInline(args.sql, 92)}` : ''}${durationSuffix}${suffix}`
     case 'data_get_docs': return `Loaded data package documentation${suffix}`
-    case 'fetch_skill': return `Loaded skill ${displayName(args.skill_id || args.name || result.name || 'skill')}${suffix}`
+    case 'fetch_skill': {
+      const source = result.source === 'bundled_library' ? ' · bundled library via installed skill' : ''
+      return `Loaded skill ${displayName(result.name || result.skill_id || args.name || args.skill_id || 'skill')}${source}${suffix}`
+    }
     case 'propose_plan': return `Submitted plan ${args.name || result.plan?.name || 'for review'}${suffix}`
     case 'update_plan': return `Updated plan${planChange(args, result)}${suffix}`
     case 'delegate_to_subagent': return `Delegated to ${args.subagent_name || call.subagent?.name || 'subagent'}${call.subagent ? ` · ${call.subagent.currentTurn || 0} turns` : ''}${suffix}`

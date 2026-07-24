@@ -37,6 +37,11 @@ def last_notebook_anchor(session_id: str) -> dict[str, Any] | None:
     return dict(anchor) if anchor else None
 
 
+def clear_notebook_anchor(session_id: str) -> bool:
+    """Forget the transient evidence anchor cached for one session."""
+    return _last_notebook_anchor.pop(session_id or "default", None) is not None
+
+
 def normalize_evidence(evidence: Any, *, session_id: str = "default") -> list[dict[str, Any]]:
     if evidence in (None, "", []):
         anchors: list[dict[str, Any]] = []

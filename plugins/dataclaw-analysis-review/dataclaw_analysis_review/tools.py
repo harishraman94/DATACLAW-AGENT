@@ -178,6 +178,8 @@ async def request_analysis_review(
         "findings_summary": run_record["findings_summary"],
         "gate": gate,
     }
+    if subagent_meta.get("reviewer_skill"):
+        result["reviewer_skill"] = subagent_meta["reviewer_skill"]
     _emit("analysis_review_updated", result)
     return result
 
@@ -416,7 +418,7 @@ async def _run_subagent_review(
         return "checklist", [], {"degradation": "subagent_unavailable"}
     task = build_reviewer_task(context)
     try:
-        outcome = await run_reviewer(task)
+        outcome = await run_reviewer(task, session_id=session_id)
     except Exception as exc:
         return "checklist", [], {"degradation": f"subagent_error: {exc}"}
     parsed = parse_reviewer_findings(str(outcome.get("result") or ""))
@@ -449,7 +451,10 @@ async def _run_subagent_review(
         plan_step_id=plan_step_id,
         session_id=session_id,
     )
-    return "subagent", finding_ids, {"subagent_turns": int(outcome.get("turns_used") or 0)}
+    meta = {"subagent_turns": int(outcome.get("turns_used") or 0)}
+    if outcome.get("reviewer_skill"):
+        meta["reviewer_skill"] = outcome["reviewer_skill"]
+    return "subagent", finding_ids, meta
 
 
 def _persist_subagent_findings(

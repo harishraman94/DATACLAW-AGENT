@@ -389,6 +389,23 @@ def delete_artifact_record(artifact_id: str) -> bool:
     return True
 
 
+def delete_session_artifacts(session_id: str) -> dict[str, Any]:
+    """Delete every published artifact record owned by one session."""
+    deleted: list[str] = []
+    root = artifacts_root()
+    for meta_file in list(root.glob("art-*/meta.json")):
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(meta.get("session_id") or "") != session_id:
+            continue
+        artifact_id = str(meta.get("id") or meta_file.parent.name)
+        if delete_artifact_record(artifact_id):
+            deleted.append(artifact_id)
+    return {"deleted_artifact_ids": deleted}
+
+
 def ensure_living_report(
     session_id: str,
     project_id: str | None = None,

@@ -100,14 +100,10 @@ async def tool_call_proxy(tool_name: str, body: ToolCallBody, request: Request) 
     hooks = request.app.state.hooks
     tracker = get_run_tracker()
 
-    # Resolve project_id from session
-    project_id: str | None = None
-    try:
-        session_data = await sessions.get_session(session_id)
-        if session_data:
-            project_id = session_data.get("projectId")
-    except Exception:
-        pass
+    session_data = await sessions.get_session(session_id)
+    if session_data is None:
+        raise HTTPException(404, "Session not found")
+    project_id: str | None = session_data.get("projectId")
 
     call_id = f"oc-{uuid.uuid4().hex[:8]}"
     clean_params = {k: v for k, v in body.params.items() if k not in _CONTEXT_KEYS}

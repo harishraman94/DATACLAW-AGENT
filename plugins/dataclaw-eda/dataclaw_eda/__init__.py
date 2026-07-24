@@ -18,6 +18,21 @@ class EdaPlugin:
         ctx.include_api_router(eda_router, prefix="/eda", tags=["eda"])
         ctx.hooks.register("preToolCallHook", eda_context_hook)
         ctx.hooks.register("postToolCallHook", eda_evidence_hook)
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_eda.evidence import clear_notebook_anchor
+            from dataclaw_eda.store import delete_session_records
+
+            def _cleanup_session(session):
+                session_id = str(session.get("id") or "")
+                return {
+                    **delete_session_records(session_id),
+                    "cleared_evidence_anchor": clear_notebook_anchor(session_id),
+                }
+
+            ctx.session_cleanup_registry.register(
+                "eda",
+                _cleanup_session,
+            )
 
         for name, description, fn, parameters in _tool_defs():
             ctx.tool_registry.register_tool(

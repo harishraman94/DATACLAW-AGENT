@@ -22,6 +22,11 @@ from pydantic import BaseModel
 
 from dataclaw.api.context import current_emitter, current_thread_id
 from dataclaw.api.run_tracker import RunState, get_run_tracker
+from dataclaw.capability_receipts import (
+    build_capability_receipt,
+    finish_capability_receipt,
+    record_tool_execution,
+)
 from dataclaw.config.resolver import resolve
 from dataclaw.events.emitter import AgentEventEmitter
 # Use text/event-stream so @ag-ui/client routes to the SSE parser (not protobuf)
@@ -199,6 +204,24 @@ async def _run_agent_loop(
     current_emitter.set(emitter)
 
     emit(emitter.run_started())
+    capability_receipt: dict[str, Any] | None = None
+
+    async def persist_capability_receipt(
+        status: str | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Best-effort audit persistence that must never break the run."""
+        if capability_receipt is None:
+            return
+        if status is not None:
+            finish_capability_receipt(capability_receipt, status, reason=reason)
+        try:
+            await sessions.upsert_capability_receipt(thread_id, capability_receipt)
+        except Exception:
+            logger.exception(
+                "Failed to persist capability receipt for run %s", run_id
+            )
 
     try:
         # Persist user message first
@@ -330,6 +353,15 @@ async def _run_agent_loop(
         state["tool_callables"] = tool_callables
         state = await hooks.run("postToolAvailabilityHook", state)
 
+        receipt_skills = state.get("skills", skills)
+        receipt_tools = state.get("tools", tool_defs)
+        capability_receipt = build_capability_receipt(
+            run_id=run_id,
+            skills=list(receipt_skills) if isinstance(receipt_skills, list) else skills,
+            tools=list(receipt_tools) if isinstance(receipt_tools, list) else tool_defs,
+        )
+        await persist_capability_receipt()
+
         # Set prompt cache key for providers that support it (e.g. OpenAI Responses API).
         from dataclaw.providers.llm.implementations.openai_responses import OpenAIResponsesLLM
         if isinstance(providers.llm, OpenAIResponsesLLM):
@@ -393,6 +425,31 @@ async def _run_agent_loop(
                             run = tracker.get_run(thread_id)
                             if run:
                                 await run._completion.wait()
+                            # External callbacks update the persisted receipt
+                            # while this task is waiting. Merge that audit trail
+                            # before applying the terminal status.
+                            persisted = await sessions.get_session(thread_id)
+                            persisted_receipts = (
+                                (persisted or {}).get("capabilityReceipts") or []
+                            )
+                            external_receipt = next(
+                                (
+                                    receipt
+                                    for receipt in persisted_receipts
+                                    if isinstance(receipt, dict)
+                                    and receipt.get("runId") == run_id
+                                ),
+                                None,
+                            )
+                            if (
+                                capability_receipt is not None
+                                and isinstance(external_receipt, dict)
+                            ):
+                                capability_receipt.clear()
+                                capability_receipt.update(external_receipt)
+                            await persist_capability_receipt(
+                                "completed", reason="external_provider"
+                            )
                             return
                         else:
                             # Normal provider — persist and finish.
@@ -414,6 +471,7 @@ async def _run_agent_loop(
                                 except Exception:
                                     logger.exception("Failed to bump autoTurnsUsed")
                             state = await hooks.run("postAgentMessageHook", state)
+                            await persist_capability_receipt("completed")
                             emit(emitter.run_finished())
                             tracker.finish_run(thread_id)
                             return
@@ -587,6 +645,15 @@ async def _run_agent_loop(
                             "args": json.dumps(tc.tool_input, default=str),
                             "result": result_json, "status": "error", **tool_timing(tc.call_id),
                         })
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result={"error": f"Unknown tool: {tc.tool_name}"},
+                                status="error",
+                            )
+                            await persist_capability_receipt()
                         continue
                     tracker.start_tool(thread_id, tc.call_id, tc.tool_name)
                     tool_started = asyncio.get_running_loop().time()
@@ -634,15 +701,26 @@ async def _run_agent_loop(
                         if llm_view_json != result_json:
                             msg_record["result_for_llm"] = llm_view_json
                         await sessions.append_message(thread_id, msg_record)
+                        visual_artifacts = _extract_visual_artifacts(
+                            tool_name=tc.tool_name,
+                            tool_call_id=tc.call_id,
+                            tool_input=tc.tool_input,
+                            result=result,
+                        )
                         await _append_visual_artifacts(
                             thread_id,
-                            _extract_visual_artifacts(
-                                tool_name=tc.tool_name,
-                                tool_call_id=tc.call_id,
-                                tool_input=tc.tool_input,
-                                result=result,
-                            ),
+                            visual_artifacts,
                         )
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result=result,
+                                status="complete",
+                                visual_artifacts=visual_artifacts,
+                            )
+                            await persist_capability_receipt()
                     except Exception as e:
                         logger.exception("Tool %s failed", tc.tool_name)
                         results_list.append({})
@@ -655,6 +733,15 @@ async def _run_agent_loop(
                             "args": json.dumps(tc.tool_input, default=str),
                             "result": result_json, "status": "error", **tool_timing(tc.call_id),
                         })
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result={"error": str(e)},
+                                status="error",
+                            )
+                            await persist_capability_receipt()
                     finally:
                         tracker.finish_tool(thread_id, tc.call_id)
 
@@ -717,20 +804,24 @@ async def _run_agent_loop(
             "message": notice_message,
             "maxTurns": max_turns,
         }))
+        await persist_capability_receipt("completed", reason="max_turns")
         emit(emitter.run_finished())
         tracker.finish_run(thread_id)
 
     except asyncio.CancelledError:
         logger.info("Agent loop cancelled for thread %s", thread_id)
+        await persist_capability_receipt("cancelled")
         emit(emitter.run_finished())
         tracker.finish_run(thread_id)
 
     except HookError as e:
+        await persist_capability_receipt("failed", reason="hook_error")
         emit(emitter.run_error(str(e)))
         tracker.finish_run(thread_id, "error")
 
     except Exception as e:
         logger.exception("Agent loop error")
+        await persist_capability_receipt("failed", reason="internal_error")
         emit(emitter.run_error(f"Internal error: {e}"))
         emit(emitter.run_finished())
         tracker.finish_run(thread_id, "error")
@@ -1075,6 +1166,8 @@ async def run_agent(
 
     thread_id = req.get_thread_id()
     run_id = req.get_run_id() or str(uuid.uuid4())
+    if await sessions.get_session(thread_id) is None:
+        raise HTTPException(404, "Session not found")
 
     # Extract user query
     user_query = ""
@@ -1385,11 +1478,50 @@ async def update_chat_session(session_id: str, req: UpdateSessionRequest) -> dic
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_chat_session(session_id: str) -> dict[str, str]:
+async def delete_chat_session(session_id: str, request: Request) -> dict[str, Any]:
+    session = await sessions.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Stop the owner task before removing files it may still be writing.
+    tracker = get_run_tracker()
+    run = tracker.get_run(session_id)
+    if run is not None and run.status == "running":
+        tracker.cancel_run(session_id)
+        if run.task is not None:
+            try:
+                await asyncio.wait_for(run.task, timeout=5)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The active run did not stop; session was not deleted",
+                ) from exc
+            except Exception:
+                # The failed/cancelled run has stopped, which is all deletion
+                # requires. Its error remains in the run tracker.
+                pass
+
+    cleanup_registry = request.app.state.session_cleanup_registry
+    try:
+        cleanup = await cleanup_registry.cleanup(session)
+    except RuntimeError as exc:
+        logger.exception("Session cleanup failed for %s", session_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Session cleanup failed; session was not deleted: {exc}",
+        ) from exc
+
     deleted = await sessions.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"status": "deleted"}
+    tracker.remove_run(session_id)
+    return {
+        "status": "deleted",
+        "session_id": session_id,
+        "cleanup": cleanup,
+    }
 
 
 class IncomingMessage(BaseModel):
@@ -1413,7 +1545,9 @@ async def receive_message(session_id: str, msg: IncomingMessage) -> dict[str, An
     message_id = msg.messageId or f"msg-{uuid.uuid4()}"
 
     existing = await sessions.get_session(session_id)
-    if existing and any(m.get("messageId") == message_id for m in existing.get("messages", [])):
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if any(m.get("messageId") == message_id for m in existing.get("messages", [])):
         return {"ok": True, "duplicate": True}
 
     record: dict[str, Any]
@@ -1447,14 +1581,20 @@ async def receive_message(session_id: str, msg: IncomingMessage) -> dict[str, An
             record["finishedAt"] = msg.finishedAt
         await sessions.append_message(session_id, record)
 
-        await _append_visual_artifacts(
-            session_id,
-            _extract_visual_artifacts(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                tool_input=parsed_args if isinstance(parsed_args, dict) else {},
-                result=parsed_result,
-            ),
+        visual_artifacts = _extract_visual_artifacts(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=parsed_args if isinstance(parsed_args, dict) else {},
+            result=parsed_result,
+        )
+        await _append_visual_artifacts(session_id, visual_artifacts)
+        await _record_external_capability_output(
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=parsed_result,
+            status=record["status"],
+            visual_artifacts=visual_artifacts,
         )
         _emit_external_tool_call(session_id, record)
     else:
@@ -1475,6 +1615,45 @@ def _json_text(value: Any) -> str:
 
 def _normalize_openclaw_tool_name(tool_name: str) -> str:
     return tool_name.removeprefix("dataclaw_")
+
+
+async def _record_external_capability_output(
+    *,
+    session_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    result: Any,
+    status: str,
+    visual_artifacts: list[dict[str, Any]],
+) -> None:
+    """Attach callback-delivered tool use to the active run receipt."""
+    session = await sessions.get_session(session_id)
+    receipts = (session or {}).get("capabilityReceipts") or []
+    run = get_run_tracker().get_run(session_id)
+    run_id = run.run_id if run is not None else None
+    receipt = next(
+        (
+            item
+            for item in reversed(receipts)
+            if isinstance(item, dict)
+            and (
+                (run_id is not None and item.get("runId") == run_id)
+                or (run_id is None and item.get("status") == "running")
+            )
+        ),
+        None,
+    )
+    if not isinstance(receipt, dict):
+        return
+    record_tool_execution(
+        receipt,
+        tool_name=tool_name,
+        call_id=tool_call_id,
+        result=result,
+        status=status,
+        visual_artifacts=visual_artifacts,
+    )
+    await sessions.upsert_capability_receipt(session_id, receipt)
 
 
 def _emit_external_tool_call(session_id: str, record: dict[str, Any]) -> None:

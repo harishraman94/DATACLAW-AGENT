@@ -180,6 +180,10 @@ class RunTracker:
             run.task.cancel()
         return True
 
+    def remove_run(self, thread_id: str) -> None:
+        """Forget all in-memory events and synchronization state for a thread."""
+        self._runs.pop(thread_id, None)
+
     def queue_message(self, thread_id: str, text: str) -> bool:
         """Queue a message for the running agent loop. Returns False if no active run."""
         run = self._runs.get(thread_id)

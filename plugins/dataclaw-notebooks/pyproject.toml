@@ -8,6 +8,7 @@ dependencies = [
     "nbformat>=5.0",
     "jupyter_client>=8.0",
     "plotly>=5.0",
+    "uv>=0.11,<0.12",
 ]
 
 [project.entry-points."dataclaw.plugins"]

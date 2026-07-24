@@ -25,6 +25,7 @@ class PluginContext:
     config: DataclawConfig
     tool_registry: Any  # DefaultToolAvailability (avoid circular import)
     guardrail_registry: Any = None  # GuardrailRegistry (avoid circular import)
+    session_cleanup_registry: Any = None  # SessionCleanupRegistry
 
     @property
     def sub_agent_registry(self):

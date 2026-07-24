@@ -29,6 +29,18 @@ class PlansPlugin:
         ctx.hooks.register("preToolCallHook", active_plan_context_hook)
         if ctx.guardrail_registry is not None:
             ctx.guardrail_registry.register(GateRiskAcceptanceGuardrail())
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_plans.mlflow_tools import delete_session_experiment
+            from dataclaw_plans.store import delete_session_records
+
+            def _cleanup_session(session):
+                session_id = str(session.get("id") or "")
+                return {
+                    **delete_session_records(session_id),
+                    "mlflow": delete_session_experiment(session_id),
+                }
+
+            ctx.session_cleanup_registry.register("plans", _cleanup_session)
 
         # Register tools
         _tools = [

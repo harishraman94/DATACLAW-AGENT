@@ -130,6 +130,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = ProviderRegistry()
     hooks = HookRegistry()
     tool_registry = init_providers(registry)
+    from dataclaw.storage.session_cleanup import SessionCleanupRegistry
+    session_cleanup_registry = SessionCleanupRegistry()
 
     # Register memory ingest hook if a real memory provider is active
     from dataclaw.providers.memory.implementations.noop import NoopMemoryProvider
@@ -157,22 +159,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     hooks.register("preToolCallHook", guardrail_registry.as_pre_hook())
     hooks.register("postToolCallHook", guardrail_registry.as_post_hook())
 
-    # Refresh the skill provider's per-request resolved set before each tool
-    # call. Without this, `list_skills` and `fetch_skill` rely on
-    # `FileSkillProvider._resolved_skills`, which is only populated by the
-    # native chat router's `resolve_skills(state)` call — so tools reaching
-    # the skill provider via the openclaw bridge proxy (or any other
-    # non-chat-loop entrypoint) get an unfiltered or stale list. Note: this
-    # writes to instance state, so concurrent requests with different
-    # session_ids race; a contextvar-based fix is the proper cure but
-    # overkill for the local single-user setup.
+    # Refresh the skill provider's request-local resolved set before each tool
+    # call. Native chat resolves it earlier in the pipeline; bridge and other
+    # entrypoints need the same session-aware boundary immediately before a
+    # list/fetch operation. FileSkillProvider stores this in a ContextVar, so
+    # concurrent sessions cannot overwrite each other's allowlists.
     skill_provider = registry.skill
 
     async def _refresh_resolved_skills(state):
-        try:
-            await skill_provider.resolve_skills(state)
-        except Exception:
-            logger.debug("skill provider resolve_skills failed during preToolCallHook", exc_info=True)
+        # Capability resolution is a security boundary. A resolution failure
+        # must block the call rather than reuse another request's ContextVar or
+        # fall back to every installed skill.
+        await skill_provider.resolve_skills(state)
         return state
 
     hooks.register("preToolCallHook", _refresh_resolved_skills)
@@ -184,15 +182,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         config=config,
         tool_registry=tool_registry,
         guardrail_registry=guardrail_registry,
+        session_cleanup_registry=session_cleanup_registry,
     )
 
     plugins = discover_plugins()
     for plugin in plugins:
         try:
-            plugin.register(ctx)
+            with tool_registry.registration_source(f"plugin:{plugin.name}"):
+                plugin.register(ctx)
             logger.info("Registered plugin: %s", plugin.name)
         except Exception:
             logger.exception("Failed to register plugin: %s", plugin.name)
+    # Run core filesystem removal after plugin handlers have closed kernels and
+    # removed records from shared stores.
+    from dataclaw.storage.session_cleanup import cleanup_core_session_files
+    session_cleanup_registry.register("core", cleanup_core_session_files)
 
     # Bootstrap plugin config defaults into the config file
     from dataclaw.config.resolver import invalidate_cache
@@ -204,6 +208,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config = config
     app.state.plugins_list = plugins
     app.state.guardrail_registry = guardrail_registry
+    app.state.session_cleanup_registry = session_cleanup_registry
 
     errors = registry.validate()
     for err in errors:
@@ -214,6 +219,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # so we call them here explicitly.
     for handler in app.router.on_startup:
         await handler()
+    tool_registry.finalize_registration()
 
     # Mount SPA static files AFTER all plugin routes are registered,
     # so the catch-all /{path:path} doesn't shadow plugin routes.

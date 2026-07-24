@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from typing import Any
 
 import duckdb
@@ -41,27 +42,31 @@ def _configured_max_query_rows() -> int:
 
 # Module-level dataset filter — set by preToolCallHook before each agent turn.
 # None means "all datasets", a list means "only these IDs".
-_allowed_dataset_ids: list[str] | None = None
+_allowed_dataset_ids: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "dataclaw_allowed_dataset_ids",
+    default=None,
+)
 
 
 def set_allowed_dataset_ids(ids: list[str] | None) -> None:
     """Set the allowed dataset filter for the current request."""
-    global _allowed_dataset_ids
-    _allowed_dataset_ids = ids
+    _allowed_dataset_ids.set(tuple(ids) if ids is not None else None)
 
 
 def _filtered_datasets() -> list[dict[str, Any]]:
     """Return datasets filtered by the current allowlist."""
     all_ds = read_datasets()
-    if _allowed_dataset_ids is None:
+    allowed_ids = _allowed_dataset_ids.get()
+    if allowed_ids is None:
         return all_ds
-    allowed = set(_allowed_dataset_ids)
+    allowed = set(allowed_ids)
     return [ds for ds in all_ds if ds.get("id") in allowed]
 
 
 def _check_dataset_allowed(dataset_id: str) -> None:
     """Raise if the dataset is not in the current allowlist."""
-    if _allowed_dataset_ids is not None and dataset_id not in set(_allowed_dataset_ids):
+    allowed_ids = _allowed_dataset_ids.get()
+    if allowed_ids is not None and dataset_id not in set(allowed_ids):
         raise ValueError(f"Dataset '{dataset_id}' is not enabled for this session")
 
 

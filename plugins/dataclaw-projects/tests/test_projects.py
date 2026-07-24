@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import dataclaw.config.paths as paths
 from dataclaw_projects.registry import (
-    list_projects, get_project, create_project, delete_project, list_project_files,
+    REQUIRED_PACKAGES,
+    create_project,
+    delete_project,
+    get_project,
+    list_project_files,
+    list_projects,
 )
 from dataclaw_projects.subagents import (
     list_subagent_definitions, get_subagent_definition,
@@ -35,6 +40,21 @@ def test_create_project(tmp_home):
     assert proj["id"] == "test-project"
     assert Path(proj["directory"]).exists()
     assert (Path(proj["directory"]) / ".dataclaw" / "project.json").exists()
+
+
+def test_create_project_replaces_unpinned_required_packages(tmp_home):
+    proj = create_project(
+        name="Pinned Runtime",
+        directory=str(tmp_home / "pinned"),
+        packages=["pandas", "mlflow>=2.0", "ipykernel>=6"],
+    )
+
+    packages = proj["kernel"]["packages"]
+    assert packages[:len(REQUIRED_PACKAGES)] == REQUIRED_PACKAGES
+    assert "mlflow==3.14.0" in packages
+    assert "mlflow>=2.0" not in packages
+    assert "ipykernel>=6" not in packages
+    assert packages.count("mlflow==3.14.0") == 1
 
 
 def test_list_projects(tmp_home):
@@ -171,6 +191,10 @@ def mock_providers_and_registry():
 
     tool_registry = MagicMock()
     tool_registry._tools = {"search": mock_tool_a, "read_file": mock_tool_b}
+    tool_registry.resolve_tools = AsyncMock(return_value=(
+        [mock_tool_a.definition, mock_tool_b.definition],
+        {"search": mock_tool_a.execute, "read_file": mock_tool_b.execute},
+    ))
 
     return providers, tool_registry
 
@@ -237,6 +261,30 @@ async def test_delegate_tool_no_allowed_tools_passes_all(mock_providers_and_regi
 
 
 @pytest.mark.asyncio
+async def test_delegate_tool_cannot_restore_parent_disabled_tools(mock_providers_and_registry):
+    providers, tool_registry = mock_providers_and_registry
+    search = tool_registry._tools["search"]
+    tool_registry.resolve_tools = AsyncMock(return_value=(
+        [search.definition],
+        {"search": search.execute},
+    ))
+    create_subagent_definition(name="Scoped Bot", allowed_tools=[])
+    delegate = make_delegate_to_subagent(providers, tool_registry)
+
+    result = await delegate(
+        subagent_name="scoped-bot",
+        task="do something",
+        dataclaw_session_id="session-scope",
+    )
+
+    assert result["status"] == "completed"
+    context = providers.sub_agent_registry.get("llm").run.call_args.kwargs["context"]
+    assert [tool["name"] for tool in context.tools] == ["search"]
+    assert set(context.tool_callables) == {"search"}
+    tool_registry.resolve_tools.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_delegate_tool_blocks_recursion(mock_providers_and_registry):
     """Subagent should never receive delegate_to_subagent tool."""
     providers, tool_registry = mock_providers_and_registry
@@ -246,6 +294,18 @@ async def test_delegate_tool_blocks_recursion(mock_providers_and_registry):
     mock_delegate.definition = {"name": "delegate_to_subagent", "description": "Delegate", "parameters": {}}
     mock_delegate.execute = AsyncMock()
     tool_registry._tools["delegate_to_subagent"] = mock_delegate
+    tool_registry.resolve_tools = AsyncMock(return_value=(
+        [
+            tool_registry._tools["search"].definition,
+            tool_registry._tools["read_file"].definition,
+            mock_delegate.definition,
+        ],
+        {
+            "search": tool_registry._tools["search"].execute,
+            "read_file": tool_registry._tools["read_file"].execute,
+            "delegate_to_subagent": mock_delegate.execute,
+        },
+    ))
 
     create_subagent_definition(name="Recursion Bot", allowed_tools=[])
     delegate = make_delegate_to_subagent(providers, tool_registry)

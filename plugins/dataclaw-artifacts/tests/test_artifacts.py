@@ -22,7 +22,9 @@ from dataclaw_artifacts.sections import (
 from dataclaw_artifacts.store import (
     MAX_EXPORTED_ARTIFACT_BYTES,
     MAX_PUBLISHED_ARTIFACT_BYTES,
+    artifacts_root,
     ensure_living_report,
+    living_report_id,
     read_manifest_events,
     read_meta,
     read_source,
@@ -206,8 +208,8 @@ async def test_publish_revise_read_and_conflict_by_source_path():
         await export_artifact(artifact_id=created["artifact_id"], version=2, session_id="other-session")
 
     listed = await list_artifacts(session_id=session_id)
-    assert listed["total"] == 2
-    assert listed["artifacts"][0]["kind"] == "living_report"
+    assert listed["total"] == 1
+    assert listed["artifacts"][0]["kind"] == "artifact"
     published = next(artifact for artifact in listed["artifacts"] if artifact["artifact_id"] == created["artifact_id"])
     assert published["latest_version"] == 2
 
@@ -815,13 +817,11 @@ async def test_report_note_creates_live_report_and_compiles_pages():
 
 
 @pytest.mark.asyncio
-async def test_list_artifacts_creates_empty_living_report():
+async def test_list_artifacts_is_read_only_for_empty_session():
     listed = await list_artifacts(session_id="session-empty")
 
-    assert listed["total"] == 1
-    assert listed["artifacts"][0]["kind"] == "living_report"
-    assert listed["artifacts"][0]["url"].endswith("/living?session_id=session-empty")
-    assert read_manifest_events(listed["artifacts"][0]["artifact_id"]) == []
+    assert listed == {"artifacts": [], "total": 0}
+    assert not (artifacts_root() / living_report_id("session-empty")).exists()
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -75,6 +76,15 @@ def session_dir(session_id: str | None = "default") -> Path:
     path = workspaces_dir() / "eda" / "findings" / safe_session_id(session_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def delete_session_records(session_id: str) -> dict[str, Any]:
+    """Delete the EDA ledger directory owned by one session."""
+    path = workspaces_dir() / "eda" / "findings" / safe_session_id(session_id)
+    existed = path.exists()
+    if existed:
+        shutil.rmtree(path)
+    return {"removed": existed}
 
 
 def hypotheses_file(session_id: str | None = "default") -> Path:

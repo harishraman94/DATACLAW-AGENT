@@ -32,6 +32,26 @@ interface QueuedMessage { id: string; text: string; ts: number }
 interface PersistedToolTiming { startedAt?: number; finishedAt?: number }
 interface ReportCounts { published: number; scratch: number }
 interface DatasetConfirmation { sessionId?: string; pendingMessage?: string; title?: string }
+interface CapabilityIdentity {
+  id?: string
+  serialId?: string
+  name?: string
+  source?: string
+  origin?: string
+  sha256?: string
+  callId?: string
+  status?: string
+}
+interface CapabilityReceipt {
+  runId: string
+  startedAt?: string
+  finishedAt?: string
+  status?: string
+  reason?: string
+  skills?: { offered?: CapabilityIdentity[]; used?: CapabilityIdentity[] }
+  tools?: { offered?: CapabilityIdentity[]; used?: CapabilityIdentity[] }
+  outputs?: Array<{ toolCallId?: string; toolName?: string; messageId?: string; status?: string; references?: Record<string, unknown>; visualArtifacts?: Array<Record<string, unknown>> }>
+}
 interface ResumeOpportunity {
   reason: 'max_turns' | 'stopped' | 'error' | 'compaction' | 'incomplete'
   title: string
@@ -319,6 +339,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [allSkills, setAllSkills] = useState<any[]>([])
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[] | null>(null)
   const [skillModalOpen, setSkillModalOpen] = useState(false)
+  const refreshedSkillCallIdsRef = useRef<Set<string>>(new Set())
 
   // Subagent filters
   const [allSubagents, setAllSubagents] = useState<any[]>([])
@@ -329,6 +350,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [allGuardrails, setAllGuardrails] = useState<any[]>([])
   const [guardrailDisabled, setGuardrailDisabled] = useState<string[]>([])
   const [guardrailModalOpen, setGuardrailModalOpen] = useState(false)
+  const [capabilityReceipts, setCapabilityReceipts] = useState<CapabilityReceipt[]>([])
 
   // Update dataset filter and persist to session
   const updateDatasetFilter = useCallback((ids: string[] | null) => {
@@ -393,6 +415,15 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
       }).catch(() => {})
     }
   }, [activeSessionId])
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const response = await fetch(`${API}/skills`)
+      if (!response.ok) return
+      const skills = await response.json()
+      setAllSkills(Array.isArray(skills) ? skills : [])
+    } catch {}
+  }, [])
 
   const updateSubagentFilter = useCallback((ids: string[] | null) => {
     setSelectedSubagentIds(ids)
@@ -535,6 +566,26 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const { messages, toolCalls, timeline, isRunning, isStopping, reconnecting, runHealth, error, sendMessage, cancelRun, checkAndReconnect, reset, setToolCalls } = useAGUI({ onRunFinished })
   sendMessageRef.current = sendMessage
+
+  // Skill-library freshness can change while the UI is open (for example after
+  // a bundled plugin update). Recheck at the session boundary and after the
+  // agent actually loads a skill instead of running a noisy timer.
+  useEffect(() => {
+    refreshedSkillCallIdsRef.current.clear()
+    void refreshSkills()
+  }, [activeSessionId, refreshSkills])
+  useEffect(() => {
+    const newlyCompleted = toolCalls.some(call => {
+      if (
+        toolBaseName(call.name) !== 'fetch_skill'
+        || call.status === 'calling'
+        || refreshedSkillCallIdsRef.current.has(call.id)
+      ) return false
+      refreshedSkillCallIdsRef.current.add(call.id)
+      return true
+    })
+    if (newlyCompleted) void refreshSkills()
+  }, [toolCalls, refreshSkills])
 
   const deleteSession = useCallback(async (sessionId: string) => {
     const response = await fetch(`${API}/chat/sessions/${sessionId}`, { method: 'DELETE' })
@@ -900,6 +951,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
         if (session?.subagentIds !== undefined) setSelectedSubagentIds(session.subagentIds)
         if (session?.guardrailConfig?.disabled) setGuardrailDisabled(session.guardrailConfig.disabled)
         else setGuardrailDisabled([])
+        setCapabilityReceipts(Array.isArray(session?.capabilityReceipts) ? session.capabilityReceipts : [])
         const restoredQueue = Array.isArray(session?.queuedMessages) ? session.queuedMessages : []
         queuedMessagesRef.current = restoredQueue
         queuePausedRef.current = Boolean(session?.queuePaused)
@@ -918,6 +970,16 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     // Load messages via MessagesSnapshot (handles both history and active run reconnection)
     checkAndReconnect(activeSessionId)
   }, [activeSessionId, reset, checkAndReconnect])
+  useEffect(() => {
+    if (!activeSessionId || isRunning) return
+    fetch(`${API}/chat/sessions/${activeSessionId}`)
+      .then(response => response.ok ? response.json() : null)
+      .then(session => {
+        if (activeSessionIdRef.current !== activeSessionId) return
+        setCapabilityReceipts(Array.isArray(session?.capabilityReceipts) ? session.capabilityReceipts : [])
+      })
+      .catch(() => {})
+  }, [activeSessionId, isRunning])
 
   // Load datasets for filter
   useEffect(() => {
@@ -928,10 +990,12 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   // Load tools, skills, subagents for filters
   useEffect(() => {
     fetch(`${API}/tools`).then(r => r.ok ? r.json() : { tools: [] }).then(d => setAllTools(d.tools ?? [])).catch(() => {})
-    fetch(`${API}/skills`).then(r => r.ok ? r.json() : []).then(setAllSkills).catch(() => {})
     fetch(`${API}/subagents/`).then(r => r.ok ? r.json() : []).then(setAllSubagents).catch(() => {})
     fetch(`${API}/guardrails`).then(r => r.ok ? r.json() : { guardrails: [] }).then(d => setAllGuardrails(d.guardrails ?? [])).catch(() => {})
   }, [])
+  useEffect(() => {
+    if (sidebarTab === 'scope') void refreshSkills()
+  }, [sidebarTab, refreshSkills])
 
   // Load project files for explorer
   const loadProjectFiles = useCallback(() => {
@@ -1659,6 +1723,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                 skills={allSkills} selectedSkillIds={selectedSkillIds} onSkillChange={updateSkillFilter}
                 subagents={allSubagents} selectedSubagentIds={selectedSubagentIds} onSubagentChange={updateSubagentFilter}
                 guardrails={allGuardrails} disabledGuardrailIds={guardrailDisabled} onGuardrailChange={updateGuardrailConfig}
+                receipts={capabilityReceipts}
               />
             )}
           </div>
@@ -1964,7 +2029,7 @@ function SessionBrowser({ sessions, onOpen, onCreate, onDelete }: {
               <span title={session.title || 'Untitled chat'} style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13, fontWeight: 600 }}>{conciseTitle(session.title || 'Untitled chat', 56)}</span>
               <span style={{ flex: '0 0 auto', color: 'var(--faint)', fontSize: 11 }}>{formatSessionDate(session.createdAt)}</span>
               <div onClick={event => event.stopPropagation()}>
-                <Popconfirm title="Delete this chat?" description="This cannot be undone." okText="Delete" okButtonProps={{ danger: true }} onConfirm={() => onDelete(session.id)}>
+                <Popconfirm title="Delete this chat and its workspace?" description="Permanently deletes this chat, its DataClaw workspace, artifacts, plans, and analysis records. Shared project files and datasets are kept." okText="Delete all" okButtonProps={{ danger: true }} onConfirm={() => onDelete(session.id)}>
                   <Button type="text" size="small" danger icon={<DeleteOutlined />} aria-label={`Delete ${session.title || 'chat'}`} />
                 </Popconfirm>
               </div>
@@ -2046,12 +2111,14 @@ function ScopePanel({
   skills, selectedSkillIds, onSkillChange,
   subagents, selectedSubagentIds, onSubagentChange,
   guardrails, disabledGuardrailIds, onGuardrailChange,
+  receipts,
 }: {
   projectName: string | null
   tools: any[]; selectedToolIds: string[] | null; onToolChange: (ids: string[] | null) => void
   skills: any[]; selectedSkillIds: string[] | null; onSkillChange: (ids: string[] | null) => void
   subagents: any[]; selectedSubagentIds: string[] | null; onSubagentChange: (ids: string[] | null) => void
   guardrails: any[]; disabledGuardrailIds: string[]; onGuardrailChange: (ids: string[]) => void
+  receipts: CapabilityReceipt[]
 }) {
   return (
     <section aria-label="Session scope" style={{ color: 'var(--ink)' }}>
@@ -2059,20 +2126,130 @@ function ScopePanel({
         {projectName ? <>Project defaults · <b>{projectName}</b><br />Changes below are session-only overrides.</> : 'Independent session scope'}
       </p>
       <ScopeGroup name="Tools" items={tools} selectedIds={selectedToolIds} getId={item => item.name} getName={item => item.label || item.display_name || item.name} describe={item => item.source} onChange={onToolChange} mono />
-      <ScopeGroup name="Skills" items={skills} selectedIds={selectedSkillIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.description} onChange={onSkillChange} />
+      <ScopeGroup name="Skills" items={skills} selectedIds={selectedSkillIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.description} getWarning={staleSkillWarning} onChange={onSkillChange} />
       <ScopeGroup name="Subagents" items={subagents} selectedIds={selectedSubagentIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.agent_type} onChange={onSubagentChange} />
       <ScopeGroup name="Guardrails" items={guardrails} selectedIds={guardrails.length ? guardrails.filter(item => !disabledGuardrailIds.includes(item.id)).map(item => item.id) : null} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => `${item.phase || 'runtime'} · ${item.mode === 'user_approval' ? 'approval' : 'auto'}`} onChange={ids => onGuardrailChange(ids === null ? [] : guardrails.map(item => item.id).filter(id => !ids.includes(id)))} />
+      <CapabilityReceipts receipts={receipts} />
     </section>
   )
 }
 
-function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChange, mono = false }: {
+function CapabilityReceipts({ receipts }: { receipts: CapabilityReceipt[] }) {
+  const recent = receipts.slice(-5).reverse()
+  return (
+    <div style={{ borderTop: '1px solid var(--line)', padding: '12px 0 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <SafetyOutlined style={{ color: 'var(--faint)' }} />
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Run receipts</span>
+        <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>{receipts.length}</span>
+      </div>
+      <p style={{ margin: '5px 0 9px 22px', color: 'var(--faint)', fontSize: 11.5, lineHeight: 1.4 }}>
+        Exact capabilities offered and used, persisted with each run.
+      </p>
+      {recent.length === 0 ? (
+        <div style={{ marginLeft: 22, color: 'var(--faint)', fontSize: 12 }}>No runs recorded yet.</div>
+      ) : recent.map(receipt => {
+        const offeredSkills = receipt.skills?.offered || []
+        const usedSkills = receipt.skills?.used || []
+        const offeredTools = receipt.tools?.offered || []
+        const usedTools = receipt.tools?.used || []
+        const outputs = receipt.outputs || []
+        return (
+          <details key={receipt.runId} style={{ margin: '0 0 7px 18px', border: '1px solid var(--line)', borderRadius: 7, padding: '7px 9px', background: 'var(--bg)' }}>
+            <summary style={{ cursor: 'pointer', color: 'var(--ink)', fontSize: 12 }}>
+              <span style={{ fontWeight: 600 }}>{receipt.status || 'unknown'}</span>
+              <span style={{ color: 'var(--faint)' }}> · {usedSkills.length} skills used · {usedTools.length} tool calls · {outputs.length} outputs</span>
+            </summary>
+            <div style={{ display: 'grid', gap: 8, marginTop: 8, color: 'var(--muted)', fontSize: 11.5 }}>
+              <div>
+                <b>Run</b> <code title={receipt.runId}>{receipt.runId}</code>
+                {receipt.reason ? ` · ${receipt.reason}` : ''}
+              </div>
+              <div><b>Offered</b> · {offeredSkills.length} skills · {offeredTools.length} tools</div>
+              <ReceiptIdentityList label="Skills offered" items={offeredSkills} />
+              <ReceiptIdentityList label="Tools offered" items={offeredTools} />
+              <ReceiptIdentityList label="Skills used" items={usedSkills} />
+              <ReceiptIdentityList label="Tools called" items={usedTools} />
+              {outputs.length > 0 && (
+                <div>
+                  <b>Outputs</b>
+                  {outputs.map((output, index) => (
+                    <div key={`${output.toolCallId || output.messageId || index}`} style={{ marginTop: 3, overflowWrap: 'anywhere' }}>
+                      <code>{output.messageId || output.toolCallId || 'output'}</code> · {output.toolName || 'tool'} · {output.status || 'unknown'}
+                      {output.references && Object.keys(output.references).length > 0
+                        ? ` · ${Object.entries(output.references).map(([key, value]) => `${key}=${String(value)}`).join(', ')}`
+                        : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </details>
+        )
+      })}
+    </div>
+  )
+}
+
+function ReceiptIdentityList({ label, items }: { label: string; items: CapabilityIdentity[] }) {
+  if (items.length === 0) return <div><b>{label}</b> · none</div>
+  return (
+    <div>
+      <b>{label}</b>
+      {items.map((item, index) => (
+        <div key={`${item.callId || item.id || item.name || index}`} style={{ marginTop: 3, overflowWrap: 'anywhere' }}>
+          <code>{item.name || item.id || 'unknown'}</code>
+          {item.id && item.id !== item.name ? ` · ${item.id}` : ''}
+          {item.source ? ` · ${item.source}` : ''}
+          {item.origin && item.origin !== 'local' ? ` (${item.origin})` : ''}
+          {item.sha256 ? ` · sha256:${item.sha256.slice(0, 12)}` : ''}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+interface ScopeItemWarning {
+  label: string
+  tooltip: string
+}
+
+function staleSkillWarning(skill: any): ScopeItemWarning | undefined {
+  if (!skill?.installed_stale) return undefined
+  const name = skill.name || skill.title || skill.id || 'This skill'
+  const reason = skill.stale_reason
+  if (reason === 'library_skill_changed') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} was installed before its bundled library instructions changed. Fix: open Skills, uninstall it, then install it again.`,
+    }
+  }
+  if (reason === 'installed_body_differs_from_library') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} differs from the bundled library copy. Fix: duplicate it as a custom skill if you need the local edits, then uninstall and reinstall the library skill.`,
+    }
+  }
+  if (reason === 'library_skill_missing') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} points to a library entry that is no longer installed. Fix: update or reinstall the plugin that supplied it, or uninstall it and create a custom replacement.`,
+    }
+  }
+  return {
+    label: 'Stale',
+    tooltip: `${name} is out of date. Fix: open Skills, uninstall it, then install the current library copy.`,
+  }
+}
+
+function ScopeGroup({ name, items, selectedIds, getId, getName, describe, getWarning, onChange, mono = false }: {
   name: string
   items: any[]
   selectedIds: string[] | null
   getId: (item: any) => string
   getName?: (item: any) => string
   describe: (item: any) => string | undefined
+  getWarning?: (item: any) => ScopeItemWarning | undefined
   onChange: (ids: string[] | null) => void
   mono?: boolean
 }) {
@@ -2081,12 +2258,20 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
   const allOn = selectedIds === null
   const off = allOn ? 0 : Math.max(0, items.length - selectedIds.length)
   const visible = showAll ? items : items.slice(0, 6)
+  const warningCount = getWarning
+    ? items.reduce((count, item) => count + (getWarning(item) ? 1 : 0), 0)
+    : 0
   return (
     <div style={{ borderTop: '1px solid var(--line)', padding: '10px 0' }}>
       <button type="button" onClick={() => setExpanded(value => !value)} aria-expanded={expanded} style={{ display: 'flex', width: '100%', alignItems: 'center', gap: 7, border: 0, padding: 0, background: 'transparent', color: 'var(--ink)', cursor: 'pointer', textAlign: 'left' }}>
         <RightOutlined style={{ fontSize: 9, transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform .15s' }} />
         <span style={{ fontSize: 13, fontWeight: 600 }}>{name}</span>
         <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>{items.length}</span>
+        {warningCount > 0 && (
+          <Tooltip title="Installed library instructions differ from the current bundled copies. Hover a stale skill below for repair steps.">
+            <Tag color="orange" style={{ margin: 0, fontSize: 10, lineHeight: '17px', paddingInline: 5 }}>{warningCount} stale</Tag>
+          </Tooltip>
+        )}
         <span style={{ marginLeft: 'auto', color: off ? 'var(--warn)' : 'var(--good)', fontSize: 11.5 }}>{items.length ? off ? `${off} off` : 'all on' : 'none defined'}</span>
       </button>
       {expanded && visible.map(item => {
@@ -2094,6 +2279,7 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
         const configuredName = getName?.(item)
         const displayName = configuredName && configuredName !== id ? configuredName : humanizeScopeId(id)
         const detail = describe(item)
+        const warning = getWarning?.(item)
         const on = selectedIds === null || selectedIds.includes(id)
         return (
           <div key={id} style={{ display: 'flex', minWidth: 0, alignItems: 'center', gap: 8, padding: '8px 2px 0 18px' }}>
@@ -2105,6 +2291,11 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
               <div title={displayName} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: mono ? 'var(--mono)' : undefined, fontSize: 13 }}>{displayName}</div>
               {displayName !== id && <div title={id} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--faint)', fontFamily: 'var(--mono)', fontSize: 11 }}>{id}</div>}
             </div>
+            {warning && (
+              <Tooltip title={warning.tooltip}>
+                <Tag color="orange" style={{ flex: '0 0 auto', margin: 0, fontSize: 10, lineHeight: '17px', paddingInline: 5 }}>{warning.label}</Tag>
+              </Tooltip>
+            )}
             {detail && <span title={detail} style={{ flex: '0 1 34%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--faint)', fontSize: 11, textAlign: 'right', whiteSpace: 'nowrap' }}>{detail}</span>}
           </div>
         )

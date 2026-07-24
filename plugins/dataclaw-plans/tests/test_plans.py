@@ -3,6 +3,7 @@
 import pytest
 
 import dataclaw.config.paths as paths
+from dataclaw.mlflow_compat import MLFLOW_VERSION
 from dataclaw_plans.store import (
     read_proposals,
     write_proposals,
@@ -14,12 +15,52 @@ from dataclaw_plans.store import (
 from dataclaw_plans.tools import propose_plan, update_plan, get_plan_decision, list_plans, get_plan
 from dataclaw_plans.hooks import active_plan_context_hook
 from dataclaw_plans.gates import accept_gate_risk, get_plan_gates, set_step_gate
+from dataclaw_plans.mlflow_tools import (
+    _client,
+    delete_session_experiment,
+    get_or_create_experiment,
+    query_mlflow_runs,
+)
 
 
 @pytest.fixture(autouse=True)
 def tmp_home(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
     return tmp_path
+
+
+# ── MLflow compatibility ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_mlflow_round_trip_matches_runtime_contract():
+    import mlflow
+
+    assert mlflow.__version__ == MLFLOW_VERSION
+
+    session_id = "mlflow-round-trip"
+    experiment_id = get_or_create_experiment(session_id)
+    client = _client()
+    run = client.create_run(
+        experiment_id,
+        tags={"mlflow.runName": "compatibility-smoke"},
+    )
+    client.log_param(run.info.run_id, "alpha", "0.1")
+    client.log_metric(run.info.run_id, "score", 0.9)
+    client.set_terminated(run.info.run_id)
+
+    result = await query_mlflow_runs(session_id=session_id)
+
+    assert "error" not in result
+    assert result["experiment_id"] == experiment_id
+    assert len(result["runs"]) == 1
+    assert result["runs"][0]["params"]["alpha"] == "0.1"
+    assert result["runs"][0]["metrics"]["score"] == 0.9
+
+    cleanup = delete_session_experiment(session_id)
+    assert cleanup["removed"] is True
+    assert cleanup["permanent"] is True
+    assert _client().get_experiment_by_name(f"dataclaw-{session_id}") is None
 
 
 # ── Propose ─────────────────────────────────────────────────────────────────
