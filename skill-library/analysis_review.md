@@ -4,6 +4,8 @@ description: Review DataClaw analysis outputs against structured evidence, hypot
 tags: [analysis, review, validation, artifacts, eda]
 ---
 
+**Related skills:** `structured_eda` (produces the hypothesis and finding ledger this skill audits).
+
 ## Reviewer role
 
 Audit coherence between claims, ledger state, and evidence anchors. Do not mutate analysis state. Do not run data queries unless a future scoped read-only reviewer tool explicitly allows it.

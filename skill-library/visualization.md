@@ -4,6 +4,8 @@ description: Create trustworthy notebook and chat visuals and prepare bounded, w
 tags: [visualization, charts, evidence, analysis]
 ---
 
+**Related skills:** `report_design` (final-report layout and composition handoff).
+
 ## Role
 
 Use this skill for analysis-time visualization and evidence preparation. Let

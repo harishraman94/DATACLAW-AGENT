@@ -6,16 +6,19 @@ tags: [modeling, machine-learning, validation, planning, method]
 
 # Predictive Modeling Playbook
 
+**Related skills:** `feature_engineering` (leakage-safe model inputs), `analysis_review` (validation gate before the step is marked ready).
+
 Use when the goal is genuinely **prediction** — score, rank, or classify units on an outcome — and no causal interpretation is being claimed. The dominant failure modes are **leakage** (the model sees information it will not have at prediction time) and **evaluating against no baseline or the wrong metric**.
 
 ## Approach
 - Define the **prediction target and the decision** it serves — the metric must match the decision (ranking → AUC / precision@k; calibrated probability → log-loss / Brier; regression → error in the units that matter).
+- Build model inputs with the `feature_engineering` skill — it owns the leakage-safe construction, encoding, and selection rules this method depends on.
 - Start with a **simple baseline**: majority class, a single strong feature, or a linear / logistic model. The complex model must beat it to justify itself.
 - Add complexity only if the baseline is insufficient and the data volume supports it.
 
 ## Threats to validity (control each)
-- **Target leakage** — features computed using the label or post-outcome information (a classic: a field populated only after the event). Audit every feature's availability at prediction time.
-- **Train/test contamination** — fit preprocessing inside each fold; keep repeating entities (users, accounts) in a single fold with **group-aware splits**; use **time-based splits** for temporal data.
+- **Target leakage** — features that use the label or post-outcome information. Construct features via the `feature_engineering` skill (fold-scoped transforms, cross-fitted encodings) and audit every feature's availability at prediction time.
+- **Train/test contamination** — keep repeating entities (users, accounts) within a single fold using **group-aware splits**, and use **time-based splits** for temporal data.
 - **Distribution shift** — the deployment population differs from training; check feature drift.
 - **Class imbalance** — accuracy is meaningless; use PR-AUC / recall at the operating point.
 - **Overfitting to the validation set** through repeated tuning — hold out a final untouched test set.

@@ -3,6 +3,8 @@ name: report_design
 description: Author and publish bespoke analytical reports from validated findings, bounded aggregate evidence, methodology, caveats, and an evidence ledger. Use for final reports, report-like dashboards, interactive analytical briefings, or redesigning existing report HTML; the creative author owns all unspecified story, prose, layout, and visual decisions.
 ---
 
+**Related skills:** `visualization` (bounded aggregate evidence and charts), `artifacts` (publish and revise the composed report).
+
 ## Role
 
 Use this skill as the sole final-report composition layer. It owns the story,

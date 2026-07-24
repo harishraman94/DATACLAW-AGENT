@@ -6,6 +6,8 @@ tags: [causal, inference, planning, method]
 
 # Causal Inference Playbook
 
+**Related skills:** `experiment_design` (when treatment can be randomized), `feature_engineering` (covariate construction), `analysis_review` (validation gate before the step is marked ready).
+
 Use this when the question is about **cause and effect** — "does X drive Y", "what is the impact of", "if we change X, what happens to Y" — not about prediction ("what predicts Y"). A predictive model answers the wrong question here and will mislead: it captures association, confounded by everything that moves with X.
 
 ## Pick an identification strategy

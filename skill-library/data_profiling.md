@@ -4,6 +4,8 @@ description: Quick dataset profiling for compact schema, summary statistics, mis
 tags: [data, analysis, profiling]
 ---
 
+**Related skills:** `structured_eda` (escalate to goal-directed EDA when the profile is not enough).
+
 ## When to use
 
 Use this skill for a quick, compact dataset profile: shape, schema, summary statistics, missingness, duplicates, basic distributions, and obvious quality flags.

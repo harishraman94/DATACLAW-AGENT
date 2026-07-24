@@ -4,6 +4,8 @@ description: Write and optimize SQL queries against registered datasets using Du
 tags: [data, sql, analysis]
 ---
 
+**Related skills:** `structured_eda` (escalate to notebook-based EDA when a single query is not enough).
+
 When the user asks a data question, answer it with SQL using the available DuckDB query tools.
 
 ## Approach

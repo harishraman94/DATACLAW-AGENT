@@ -4,6 +4,8 @@ description: Publish, revise, inspect, export, and troubleshoot DataClaw artifac
 tags: [artifacts, reporting, dashboards, visualization, publishing]
 ---
 
+**Related skills:** `report_design` (composes the report this skill publishes).
+
 ## When to use
 Use this skill whenever the final visual or written deliverable should be a
 DataClaw artifact: reports, dashboards, chart pages, data profile reports,

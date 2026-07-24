@@ -6,6 +6,8 @@ tags: [experimentation, ab-testing, causal, planning, method]
 
 # Experiment Design Playbook
 
+**Related skills:** `causal_inference` (when treatment cannot be randomized), `feature_engineering` (covariate construction for uplift/heterogeneity), `analysis_review` (validation gate before the step is marked ready).
+
 Use when a change can be (or was) randomized and the question is its causal effect. Randomization is the strongest identification there is — the work is in designing it correctly and analyzing it honestly. If treatment cannot be randomized, fetch `causal_inference` instead.
 
 ## Design decisions (settle before any data)

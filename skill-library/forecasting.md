@@ -6,13 +6,15 @@ tags: [forecasting, time-series, validation, planning, method]
 
 # Forecasting Playbook
 
+**Related skills:** `feature_engineering` (leakage-safe lag/calendar features), `analysis_review` (validation gate before the step is marked ready).
+
 Use for predicting a quantity over future time — demand, revenue, load, churn timing. The failure modes are **temporal leakage** (using future information to predict the past) and **evaluating against no baseline**, which makes a mediocre model look good.
 
 ## Method choice follows the data
 - Inspect first: trend, seasonality (and its period), missing periods, level shifts, and whether the series is stationary.
 - **Seasonal-naive / naive** — always compute this first. It is the baseline every model must beat.
 - **Classical (ETS, ARIMA / SARIMA)** — strong for a single series with clear trend/seasonality and limited exogenous drivers.
-- **Regression / gradient boosting on lag & calendar features** — when exogenous regressors matter and you have many series or rich covariates. Guard feature leakage (only past-available features).
+- **Regression / gradient boosting on lag & calendar features** — when exogenous regressors matter and you have many series or rich covariates. Build the lag/calendar/rolling features via the `feature_engineering` skill, which owns the past-availability and fold-scoped construction rules.
 - **Global / hierarchical models** — many related series; reconcile forecasts if totals must add up.
 
 ## Threats to validity (control each)

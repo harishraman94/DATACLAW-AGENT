@@ -5,6 +5,8 @@ description: Use Dataclaw tools for governed data science and analytics work. In
 
 # Dataclaw Data Science Workflow
 
+**Related skills (by phase):** EDA — `structured_eda`, `data_profiling`; modeling — `causal_inference`, `forecasting`, `experiment_design`, `predictive_modeling`, `feature_engineering`; delivery — `visualization`, `report_design`, `artifacts`; governance — `analysis_review`.
+
 Use this skill when the user asks for data analysis, exploratory data analysis, notebook work, modeling, profiling, segmentation, visualization, or a data science report.
 
 Follow this process:
@@ -36,7 +38,7 @@ If the dataset is not available via the helper, you can check the content of the
     - **Grouped workstreams, expected deliverables, explicit out-of-scope / non-goals, validation and QA checks, risks or open questions, and execution order.**
 8. The Dataclaw UI will send the user's approval, denial, or requested edits back as a normal chat message.
 9. If the user denies the plan or requests edits in chat, simply call `dataclaw_propose_plan` again with the revised plan. Dataclaw will automatically update the existing unapproved proposal.
-10. After an approval message, execute the flow in the notebook. Keep outputs reproducible, prefer `dataclaw_data.get_dataframe(...)` and polars or pandas transformations, and write durable intermediate artifacts where useful. Keep cells focused and concise, and avoid doing too much in a single cell. If a step has multiple distinct actions or findings, consider breaking it into multiple cells for clarity and better progress reporting. This may also avoid timeouts.
+10. After an approval message, execute the flow in the notebook. Keep outputs reproducible, prefer `dataclaw_data.get_dataframe(...)` and polars or pandas transformations, and write durable intermediate artifacts where useful. When a step constructs model inputs, fetch the `feature_engineering` skill for leakage-safe feature construction and extraction. Keep cells focused and concise, and avoid doing too much in a single cell. If a step has multiple distinct actions or findings, consider breaking it into multiple cells for clarity and better progress reporting. This may also avoid timeouts.
 11. Any trained model should be logged to mlflow with a new run and meaningful names, tags, metrics, datasets, artifacts, and parameters.
 12. Report progress with `dataclaw_update_plan` after every step status change and after every completed step (must have called `dataclaw_propose_plan` first as you can't update a non-proposed plan). When a step completes, populate that step's `summary` with the actions taken, key findings, validation checks, caveats, and next implication. Record material EDA observations with `dataclaw_record_eda_finding`, supersede changed findings with `dataclaw_supersede_eda_finding`, and call `dataclaw_summarize_eda_readiness` before proposing modeling/dashboard work that depends on EDA. Populate `outputs` with every durable file produced by the step.
 13. Use notebook visuals when they help the analysis, and deliver the final report through the governed report pipeline:

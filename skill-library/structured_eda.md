@@ -4,6 +4,8 @@ description: Run goal-directed exploratory data analysis tailored to the user's 
 tags: [data, analysis, eda, exploratory-analysis, data-quality, profiling]
 ---
 
+**Related skills:** `data_profiling` (quick-profile alternative), `visualization` (analysis charts), `report_design` (final report), `analysis_review` (readiness and validation gate).
+
 ## When to use
 
 Use this skill when the user asks to explore, understand, profile, audit, or prepare a dataset before modeling, dashboarding, reporting, segmentation, forecasting, survey analysis, or decision support.
