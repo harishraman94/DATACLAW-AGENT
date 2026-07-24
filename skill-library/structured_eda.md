@@ -127,7 +127,7 @@ Use this loop:
 2. **Observe.** Name the pattern, anomaly, data-quality issue, segment difference, correlation, or domain inconsistency.
 3. **Interpret.** Explain why it might matter for the user's goal. Is it a real signal, data artifact, leakage risk, denominator issue, or domain constraint?
 4. **Branch.** Choose one focused follow-up check that can confirm, weaken, reject, or reframe the hypothesis.
-5. **Validate.** Follow `insight_validation` before any `confirmed` disposition: internal recompute or denominator/grain check, plus external plausibility or the mandatory unverified caveat.
+5. **Validate.** Follow the **Validation protocol** below before any `confirmed` disposition: internal recompute or denominator/grain check, plus external plausibility or the mandatory unverified caveat.
 6. **Decide.** Call `record_eda_finding` with disposition `confirmed`, `weakened`, `rejected`, `unresolved`, or `blocked`. Include `hypothesis_id` and `hypothesis_status` when the finding dispositions a hypothesis.
 7. **Update.** Revise the EDA mode, assumptions, column roles, readiness verdict, or next-step recommendation if the insight changes them. Mark untested leftovers as `open` with `disposition_reason: "deferred: loop budget"` so readiness treats them as caveats, not blockers.
 
@@ -154,6 +154,48 @@ Looping rules:
 - Keep an insight log in the notebook/report, but the ledger is authoritative: hypothesis, evidence, follow-up check, decision, caveat, and readiness implication must be persisted through the EDA tools.
 
 At the Decide step, pass `loop_index` as the 1-based insight-loop number on both `record_eda_finding` and any direct `update_eda_hypothesis` call. If the candidate was selected from a screen across many segments, correlations, columns, cohorts, or other candidates, pass `selection` with `screened_n`, `selection_rule`, and `correction`; use `fdr_bh`, `bonferroni`, or `holdout_confirmed` before treating the internal validation as confirmed/high-confidence. A targeted pre-registered hypothesis from the initial ledger does not need a multiplicity correction unless the actual evidence came from an additional screen.
+
+## Validation protocol
+
+Validate an insight on both internal recomputation and external plausibility
+before recording it as `confirmed` or with high confidence. One loop validates
+one claim; keep it focused enough that the evidence cites one or two notebook
+cells or structured anchors.
+
+1. Restate the candidate insight and the unit of observation.
+2. **Internal validation:** recompute on an independent slice, run a
+   denominator/grain check, test a segment/time/missingness cohort, or scan for
+   contradictions against `list_eda_findings` and `list_eda_hypotheses`.
+3. **External validation:** compare magnitude and direction against domain
+   priors, known valid ranges, operational definitions, sampling design, user
+   confirmation, or a reference lookup when available.
+4. Decide the disposition (`confirmed`, `weakened`, `rejected`, `unresolved`,
+   `blocked`) as defined in the insight loop above.
+5. If external validation is unavailable, set `validation.external.status` to
+   `unverified`; the EDA tool caps confidence and adds the mandatory caveat.
+
+Record both axes in the finding:
+
+```json
+{
+  "validation": {
+    "internal": {
+      "status": "validated",
+      "method": "recomputed by segment and checked denominator grain",
+      "evidence_refs": ["notebook_cell:abc123"]
+    },
+    "external": {
+      "status": "unverified",
+      "basis": "none",
+      "note": "No deployment-domain source available in this session"
+    }
+  }
+}
+```
+
+High confidence requires internal `validated` plus non-empty `evidence_refs`. Do
+not self-certify correctness; validation raises the confidence floor but does not
+prove truth.
 
 ## Correlation and relationship rules
 
