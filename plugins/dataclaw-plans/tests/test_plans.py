@@ -705,7 +705,23 @@ async def test_planning_reasoning_hook_elevates_while_drafting_then_stops():
 
 @pytest.mark.asyncio
 async def test_planning_reasoning_hook_ignores_missing_session():
-    assert "reasoning_effort" not in await planning_reasoning_hook({"session_id": ""})
+    assert (await planning_reasoning_hook({"session_id": ""})).get("reasoning_effort", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_clears_stale_effort_after_mid_run_approval():
+    """Auto-mode approves mid-run: a value set on the drafting turn must be cleared,
+    not carried onto execution turns within the same graph run."""
+    sid = "sess-1"
+    r = await propose_plan(
+        name="P", description="d", steps=[{"name": "s", "description": "d"}],
+        plan_markdown="# Plan\n\n## QA\nCheck counts.", session_id=sid,
+    )
+    await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
+
+    # State still carries the elevated effort from the earlier drafting turn.
+    out = await planning_reasoning_hook({"session_id": sid, "reasoning_effort": "medium"})
+    assert out["reasoning_effort"] == ""
 
 
 @pytest.mark.asyncio

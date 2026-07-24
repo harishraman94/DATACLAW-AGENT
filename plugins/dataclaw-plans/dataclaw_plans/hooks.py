@@ -37,14 +37,18 @@ async def planning_reasoning_hook(state: AgentState) -> AgentState:
     Plan drafting is the most consequential turn in the flow but is otherwise
     emitted at the model's default (no thinking budget). While the session is in
     the planning phase, set a per-turn reasoning effort that the agent provider
-    passes through to the LLM; ordinary execution turns are left untouched.
+    passes through to the LLM; ordinary execution turns run at the default.
+
+    Authoritative and idempotent: it also *clears* a previously-set effort once
+    the plan is approved partway through a single run (e.g. auto-mode, where
+    propose_plan auto-approves), so execution turns in that run are not left
+    elevated by a value carried over from the drafting turn.
     """
-    effort = resolve("plugins.plans.reasoning_effort", "DATACLAW_PLANS_REASONING_EFFORT", "medium")
-    if not effort:
+    configured = resolve("plugins.plans.reasoning_effort", "DATACLAW_PLANS_REASONING_EFFORT", "medium")
+    desired = configured if (configured and _in_planning_phase(state.get("session_id", ""))) else ""
+    if desired == (state.get("reasoning_effort") or ""):
         return state
-    if not _in_planning_phase(state.get("session_id", "")):
-        return state
-    return {**state, "reasoning_effort": effort}
+    return {**state, "reasoning_effort": desired}
 
 
 def _step_identity(step: dict) -> str:
