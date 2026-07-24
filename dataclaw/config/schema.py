@@ -31,6 +31,11 @@ class CodexConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     backend: str = "openclaw"  # openclaw | anthropic | openai | gemini | codex
+    # Reasoning/thinking effort applied to main-loop turns (minimal|low|medium|high).
+    # Empty means "leave the model at its default" (no thinking budget applied).
+    # Raises the reasoning budget for consequential turns like plan drafting.
+    # Only affects the direct LangChain backends; openclaw sets this on its own side.
+    reasoning_effort: str = ""
     anthropic: AnthropicConfig = AnthropicConfig()
     openai: OpenAIConfig = OpenAIConfig()
     gemini: GeminiConfig = GeminiConfig()

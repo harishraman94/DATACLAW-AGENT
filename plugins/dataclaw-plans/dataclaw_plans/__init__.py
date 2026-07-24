@@ -52,11 +52,12 @@ class PlansPlugin:
                     "plan_markdown": {
                         "type": "string",
                         "description": (
-                            "Detailed Markdown review document for plan.md. Include objective, prior observations, "
-                            "assumptions or data limits, grouped workstreams, validation checks, deliverables, "
-                            "risks or open questions, and execution notes. This should be richer than the compact steps."
+                            "Required detailed Markdown review document for plan.md — the substance a lead reviews, "
+                            "richer than the compact steps. Must cover: objective; what is already known from prior "
+                            "inspection (cite the initial hypothesis ledger from propose_eda_hypotheses); assumptions "
+                            "and data limitations; grouped workstreams; validation and QA checks; expected "
+                            "deliverables; risks or open questions; and execution order. Do not leave this empty."
                         ),
-                        "default": "",
                     },
                     "steps": {
                         "type": "array",
@@ -78,7 +79,7 @@ class PlansPlugin:
                     },
                     "context": {"type": "string", "description": "Additional context", "default": ""},
                 },
-                "required": ["name", "description", "steps"],
+                "required": ["name", "description", "steps", "plan_markdown"],
             }),
             ("update_plan", "Update progress for steps on an existing plan", update_plan, {
                 "type": "object",
