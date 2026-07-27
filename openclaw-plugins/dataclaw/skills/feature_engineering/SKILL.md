@@ -1,25 +1,57 @@
 ---
 name: feature_engineering
-description: Build model inputs without leaking the target — fold-scoped transforms, cross-fitted encodings, temporal availability, leakage-safe selection — a shared phase inside predictive, forecasting, and causal work.
-tags: [feature-engineering, extraction, leakage, validation, method]
+description: Build reproducible, leakage-safe model inputs inside the Dataclaw data-science workflow by defining prediction-time availability, excluding identifiers, fitting transforms within folds, cross-fitting target-derived features, handling temporal and grouped data correctly, and versioning feature lineage. Use for tabular, temporal, categorical, text, geospatial, nested, interaction, aggregation, embedding, selection, and dimensionality-reduction features used by predictive, forecasting, causal, uplift, or segmentation models.
+tags: [feature-engineering, extraction, leakage, lineage, method]
 ---
+
+**Related skills:** `dataclaw_data_science` (governed workflow), `structured_eda` (data types and quality), `predictive_modeling`, `forecasting`, `causal_inference`, and `segmentation` (own the model/design evaluation), `analysis_review` (validation gate).
 
 # Feature Engineering Playbook
 
-**Related skills:** `predictive_modeling`, `forecasting`, `causal_inference` (fetch this when their step builds model inputs); `structured_eda` (shows which features matter).
+Feature engineering is a phase inside another method, not a standalone modeling question. This skill owns feature definitions, availability, leakage control, transformations, lineage, and reproducibility; the parent method owns splits, baselines, estimands, metrics, and model selection. There is no feature-engineering tool or plugin to call: construct features in the notebook with standard dataframe and model-pipeline libraries.
 
-Use whenever you build model inputs — features for `predictive_modeling` or `forecasting`, or covariates for `causal_inference`. It is a **phase inside** those methods, not a separate question. Extraction itself is standard — temporal, text, categorical, and nested/geo fields become typed columns with recorded provenance. The risk that makes this a skill is **leakage**: information the model won't have at prediction time, which inflates validation scores and fails in production.
+Follow this process:
 
-## Threats to validity (control each)
-All of these enforce one rule: *nothing the model uses may depend on data it won't have at prediction time.*
-- **Preprocessing leakage** — scalers, imputers, encoders, PCA, or text vectorizers fit on data that includes the validation rows. Fit every transform inside the training fold, then apply to validation; never fit on the full dataset before the split.
-- **Target leakage** — features derived from the label or populated at or after the predicted event. Cross-fit target encoding, WOE, and mean-by-group out-of-fold; exclude post-outcome fields.
-- **Temporal look-ahead** — lags or rolling windows that peek across the horizon. Every feature must be computable from data available at prediction time.
-- **Selection leakage** — feature selection that sees the target must run inside cross-validation, not once on the full dataset, or the validation score is optimistic.
-- **Redundancy** — collinear features destabilize estimates; prune or regularize.
+1. Fix the parent method’s unit, index time, prediction/treatment time, horizon, split unit, target/estimand, and deployment inputs. A feature is eligible only if its value and every source event would be available at the decision timestamp.
+2. Inventory raw fields with `structured_eda`. Classify each as identifier/join key, target/post-outcome, protected audit attribute, continuous, count, nominal, ordinal, datetime, text, geo, nested, or unavailable at serving time.
+3. Create a feature contract before construction: name, definition, source fields, grain, window, cutoff/inclusion boundary, missingness meaning, transformation, availability latency, owner, and expected serving behavior.
+4. Audit direct identifiers and high-cardinality near-identifiers. Keep names, emails, phone numbers, account/customer/patient ids, free-text identifiers, and join keys outside the feature matrix; preserve a protected join key separately only when results must be reattached.
+5. Propose feature work inside the parent method’s plan. State leakage controls, preprocessing graph, folds, target-derived transformations, temporal windows, selection route, unknown-category behavior, missing-input policy, dimensionality limits, and lineage/version outputs.
+6. Build one reproducible `Pipeline`/`ColumnTransformer` or equivalent graph. Fit imputation, scaling, encoding, vectorization, PCA, selection, resampling, and learned aggregations only on training folds.
+7. Validate the feature matrix in every fold: row/grain preservation, no future timestamps, stable schema/order/dtypes, finite values, unknown categories, realistic missingness, bounded cardinality, and absence of identifiers/target columns.
+8. Compare an auditable raw/minimal feature set against engineered candidates under the parent method’s fixed evaluation. Drop complexity that does not improve out-of-sample decision performance or robustness.
+9. Log the fitted pipeline, feature contract, source/version hashes, final feature names, training cutoff, library versions, and validation results to MLflow. Serving must reuse the serialized transform, not reimplement notebook logic.
+10. Hand the matrix and audit back to the parent method. Refuse validation when a load-bearing feature cannot be reproduced at serving time or its lineage/cutoff is unknown.
 
-## What the plan must state
-It has no plan section of its own; it feeds the method playbook's. In `plan_markdown` under **Method and rationale**, state the feature set and extraction steps; under **Assumptions, data limitations, and threats to validity**, state the leakage controls (fold-scoped fitting, cross-fitted encodings, temporal availability). The method playbook's evaluation protocol then validates they hold.
+## Transformation routing
 
-## Execution notes
-Load the frame with `dataclaw_data.get_dataframe(...)` and build transforms so they fit per fold — a scikit-learn `Pipeline` / `ColumnTransformer` inside the split, not a global `fit` beforehand. Display a feature-availability / leakage audit before training with `dataclaw_display_cell_output`, record feature definitions with `dataclaw_record_eda_finding` or the plan step `summary`, and log the fitted pipeline to MLflow. This skill adds **no tools of its own**: hand the constructed features back to the method playbook, which owns the split scheme, baseline, and evaluation. If a feature needs a capability the platform does not provide, name the gap; do not invent a feature tool.
+| Feature type | Preferred route | Load-bearing rule |
+|---|---|---|
+| Continuous/count | Impute, transform skew if warranted, scale for scale-sensitive models | Fit parameters inside folds; preserve missingness meaning |
+| Nominal categorical | One-hot/ordinal by model, hashing for controlled high cardinality | Define unknown-category behavior; do not encode ids |
+| Target/mean/WOE encoding | Cross-fitted encoding with smoothing | Each row’s encoding excludes its own target and validation targets |
+| Ordered categorical | Explicit validated order | Do not infer order from lexical or arbitrary numeric codes |
+| Temporal event history | Lag/window features with explicit cutoff and closed/open boundary | No event after decision time; account for ingestion latency |
+| Repeated entity aggregates | Past-only group aggregates, cross-fitted when target-derived | Prevent the same entity or future rows leaking across folds |
+| Text | Fold-fitted vectorizer or versioned embedding model | Remove direct identifiers; pin model/version and truncation |
+| Geo | Governed coarse geography, distances, or spatial aggregates | Avoid exact-location leakage and protected-class proxies |
+| Dimensionality reduction | Fold-fitted PCA/SVD; supervised selection inside folds | Validate retained information and downstream stability |
+| Interactions | Domain-justified or regularized search | Avoid unbounded combinatorial expansion |
+
+## Leakage and reproducibility contract
+
+- **Availability leakage:** use event time plus ingestion/processing latency, not merely the row timestamp. Late-arriving corrections unavailable at decision time are future information.
+- **Preprocessing leakage:** fit every data-dependent transform on training data only. A globally fitted vocabulary, imputer, scaler, PCA, or selector contaminates validation.
+- **Target leakage:** exclude post-outcome fields; cross-fit any target-derived encoding or aggregate. Never use full-data target statistics as a feature.
+- **Entity leakage:** group recurring entities into one fold unless the deployment task explicitly predicts later observations for known entities with a time-forward split.
+- **Selection leakage:** perform target-aware selection and dimensionality decisions inside the tuning loop; unsupervised transforms can still leak distributional information if globally fitted.
+- **Training-serving skew:** test the serialized pipeline on raw holdout-shaped input, including missing columns, unseen categories, and delayed sources.
+- **Lineage:** every output feature must map to source fields, window, transform version, and cutoff. Opaque notebook columns are not deployable features.
+
+## Missingness, cardinality, and drift
+
+Treat missingness as data-generating information: distinguish not-applicable, not-yet-observed, unavailable, and corrupted. Add a missing indicator only when it is available at serving time and improves validated performance; never impute across time from future observations. Collapse rare categories using training-fold counts and an explicit unknown bucket. Monitor source availability, missingness, category churn, range violations, and feature/embedding drift; the parent modeling skill decides retraining or threshold action.
+
+## Domain controls
+
+An opt-in domain profile is a technical control bundle, not proof of compliance. Treat protected attributes as audit fields outside the production matrix unless explicitly authorized; audit proxies before consequential use. Coarsen or exclude precise location, free text, and rare combinations that can re-identify people. Keep raw PII out of model-visible output; suppress every sensitive diagnostic cell below a default 5 units (raise but never lower the floor) with complementary suppression so visible totals cannot reconstruct it. Require human review when feature construction materially changes eligibility, pricing, credit, employment, or care decisions.
