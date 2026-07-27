@@ -1,38 +1,25 @@
 ---
 name: feature_engineering
-description: Construct and extract model inputs without leaking the target — fold-scoped transforms, cross-fitted encodings, temporal availability, leakage-safe selection — as a shared phase inside predictive, forecasting, and causal work.
+description: Build model inputs without leaking the target — fold-scoped transforms, cross-fitted encodings, temporal availability, leakage-safe selection — a shared phase inside predictive, forecasting, and causal work.
 tags: [feature-engineering, extraction, leakage, validation, method]
 ---
 
 # Feature Engineering Playbook
 
-**Related skills:** `structured_eda` (surfaces which features matter); fetched by `predictive_modeling`, `forecasting`, and `causal_inference` when a step builds model inputs.
+**Related skills:** `predictive_modeling`, `forecasting`, `causal_inference` (fetch this when their step builds model inputs); `structured_eda` (shows which features matter).
 
-Use whenever you are building model inputs — for `predictive_modeling`, `forecasting`, or covariate construction in `causal_inference`. This is a **phase inside** those methods, not a question type; fetch it alongside the method playbook when the step constructs features. Its dominant failure mode is **leakage**: giving the model information it will not have at prediction time, which inflates validation scores and collapses in production.
+Use whenever you build model inputs — features for `predictive_modeling` or `forecasting`, or covariates for `causal_inference`. It is a **phase inside** those methods, not a separate question. Extraction itself is standard — temporal, text, categorical, and nested/geo fields become typed columns with recorded provenance. The risk that makes this a skill is **leakage**: information the model won't have at prediction time, which inflates validation scores and fails in production.
 
-## Extraction (the constructive front-end)
-Turn raw fields into modeling signal, and record each feature's definition and source for the report evidence ledger.
-- **Dates/timestamps** — calendar parts, time-since-event, business-day flags; never a feature that encodes the future.
-- **Text** — length/counts, TF-IDF, or embeddings; fit the vectorizer/vocabulary on training data only.
-- **Categoricals** — one-hot for low cardinality; frequency or **cross-fitted target encoding** for high cardinality (never plain target encoding on the full data — it leaks the label).
-- **Geo / JSON / nested** — flatten to typed columns; keep provenance.
-
-## Leakage-safe construction (the core discipline)
-- **Fit transforms inside the fold.** Scalers, imputers, encoders, PCA, and feature selection must be fit on the training partition only, then applied to validation — never fit on the full dataset before splitting.
-- **Only past-available information.** For temporal data, every feature must be computable from data available at prediction time. Lags and rolling windows must not peek across the horizon.
-- **No post-outcome fields.** Exclude anything populated by or after the event being predicted (a classic silent leak).
-- **Cross-fit target-derived features.** Target encoding, WOE, and mean-by-group must be computed out-of-fold.
-- **Selection is part of the model.** Feature selection that looks at the target must happen inside cross-validation, not once on all data — otherwise the validation score is optimistic.
-
-## Threats to validity (name and control each)
-- **Target leakage** — post-outcome or label-derived features. Audit every feature's availability at prediction time.
-- **Preprocessing leakage** — transforms fit on data that includes the validation rows.
-- **Temporal look-ahead** — features using future information for a past prediction.
-- **Selection leakage** — choosing features on the full dataset before validation.
-- **Redundancy / dimensionality** — many collinear features destabilize estimates; prune or regularize.
+## Threats to validity (control each)
+All of these enforce one rule: *nothing the model uses may depend on data it won't have at prediction time.*
+- **Preprocessing leakage** — scalers, imputers, encoders, PCA, or text vectorizers fit on data that includes the validation rows. Fit every transform inside the training fold, then apply to validation; never fit on the full dataset before the split.
+- **Target leakage** — features derived from the label or populated at or after the predicted event. Cross-fit target encoding, WOE, and mean-by-group out-of-fold; exclude post-outcome fields.
+- **Temporal look-ahead** — lags or rolling windows that peek across the horizon. Every feature must be computable from data available at prediction time.
+- **Selection leakage** — feature selection that sees the target must run inside cross-validation, not once on the full dataset, or the validation score is optimistic.
+- **Redundancy** — collinear features destabilize estimates; prune or regularize.
 
 ## What the plan must state
-In `plan_markdown`, under **Method and rationale** and **Threats to validity**: the feature set you will build and why, the extraction steps, and the explicit leakage controls (fold-scoped fitting, cross-fitted encodings, temporal availability). The evaluation protocol in the method playbook then validates that these controls hold.
+It has no plan section of its own; it feeds the method playbook's. In `plan_markdown` under **Method and rationale**, state the feature set and extraction steps; under **Assumptions, data limitations, and threats to validity**, state the leakage controls (fold-scoped fitting, cross-fitted encodings, temporal availability). The method playbook's evaluation protocol then validates they hold.
 
 ## Execution notes
-Implement transforms so they can be fit per fold (e.g. a pipeline), not once globally. Display a feature-availability/leakage audit before training and record feature definitions for the report. Hand the constructed features back to the method playbook's evaluation step, which owns the split scheme and baseline.
+Load the frame with `dataclaw_data.get_dataframe(...)` and build transforms so they fit per fold — a scikit-learn `Pipeline` / `ColumnTransformer` inside the split, not a global `fit` beforehand. Display a feature-availability / leakage audit before training with `dataclaw_display_cell_output`, record feature definitions with `dataclaw_record_eda_finding` or the plan step `summary`, and log the fitted pipeline to MLflow. This skill adds **no tools of its own**: hand the constructed features back to the method playbook, which owns the split scheme, baseline, and evaluation. If a feature needs a capability the platform does not provide, name the gap; do not invent a feature tool.
