@@ -25,4 +25,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pytest pytest-asyncio
-      - run: pytest tests/test_skill_manifest_sync.py -v -o addopts=""
+      # --noconftest keeps this job dependency-light: the shared tests/conftest.py
+      # eagerly imports the app (fastapi et al.), which this isolated job does not
+      # install. The parity test uses no fixtures from it, so skipping conftest
+      # loading is safe and preserves the fast, app-import-free design.
+      - run: pytest tests/test_skill_manifest_sync.py --noconftest -v -o addopts=""
