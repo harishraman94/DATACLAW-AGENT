@@ -137,8 +137,13 @@ def test_segmentation_skill_encodes_statistical_and_decision_guardrails():
         "persuadables from sure-things and sleeping-dogs",
         # Measurement-level correctness.
         "never one-hot categoricals into k-means",
+        # Direct identifiers and PII never enter the feature matrix or profiles.
+        "exclude names, email addresses, phone numbers",
+        "join keys from the feature matrix and model-visible profiles",
         # Density clustering treats noise honestly.
         "Noise is a legitimate class",
+        "HDBSCAN noise is coverage, not a cluster",
+        "silhouette undefined: fewer than two non-noise clusters",
         # Actionability / operationalization.
         "typing/assignment model",
         "substantial",
