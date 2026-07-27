@@ -14,7 +14,8 @@ model cards, stakeholder exports, and living-report notes.
 This skill owns artifact lifecycle behavior. For content and layout, also fetch:
 - `report_design` for final report authorship, evidence review, and quality gates
 - `visualization` only when analysis-time charting or evidence preparation is needed
-- `structured_eda`, `sql_analyst`, or a modeling pack (e.g. `simple_regression`) when the artifact is evidence from those workflows
+- `structured_eda`, `sql_analyst`, or a modeling playbook such as
+  `predictive_modeling` when the artifact is evidence from those workflows
 
 ## Core rule
 The notebook computes, `report_design` authors, and artifacts publish. Do not leave the
