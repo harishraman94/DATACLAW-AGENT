@@ -4,13 +4,24 @@ description: Run goal-directed exploratory data analysis tailored to the user's 
 tags: [data, analysis, eda, exploratory-analysis, data-quality, profiling]
 ---
 
-**Related skills:** `data_profiling` (quick-profile alternative), `visualization` (analysis charts), `report_design` (final report), `analysis_review` (readiness and validation gate).
+**Related skills:** `survey_analytics` (survey-specific methods and claim rules), `segmentation` (grouping units into segments, personas, or tiers), `data_profiling` (quick-profile alternative), `visualization` (analysis charts), `report_design` (final report), `analysis_review` (readiness and validation gate).
 
 ## When to use
 
 Use this skill when the user asks to explore, understand, profile, audit, or prepare a dataset before modeling, dashboarding, reporting, segmentation, forecasting, survey analysis, or decision support.
 
 Use `structured_eda` instead of a generic profile when the analysis needs judgment: the goal, domain, data grain, data types, or downstream use should change what gets checked and how results are interpreted.
+
+For survey, poll, questionnaire, tracker, panel, or survey-verbatim data, fetch
+and follow `survey_analytics`. When both skills are active, `survey_analytics`
+governs survey-specific method, denominator, weighting, suppression, and
+interpretation rules; this skill continues to govern the hypothesis/finding
+ledger, insight loops, generic quality checks, and readiness verdict.
+
+When the goal is to divide the population into segments, personas, or tiers,
+fetch `segmentation` before proposing the clustering approach; `structured_eda`
+still owns the feature-space, scale, and cluster-tendency checks that decide
+whether segmentation is warranted at all.
 
 If the user only asks for a quick profile, run the compact version: shape, schema, missingness, duplicates, key distributions, obvious quality flags, and 3-5 first findings.
 
