@@ -14,6 +14,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import re
 import time
 from contextlib import suppress
@@ -1279,6 +1280,74 @@ def _bounded_repair_prompt(
     return trimmed + required
 
 
+# ── E2E test seam ─────────────────────────────────────────────────────────────
+# NOT a product authoring mode. When DATACLAW_VISUAL_AUTHOR_E2E_STUB=1, the
+# creative author's model calls are replaced by a deterministic stub so the
+# report→artifact end-to-end test does not hinge on live-model output clearing
+# the structural gate. Everything real still runs on the stub's output — the
+# dossier build, structural validation, evidence review, rendering, and the
+# publish gates — only the model text is faked. The single-path creative
+# contract is unchanged for every non-test caller.
+def _visual_author_e2e_stub_enabled() -> bool:
+    return os.environ.get("DATACLAW_VISUAL_AUTHOR_E2E_STUB") == "1"
+
+
+def _synthesize_stub_document(contract: dict[str, Any]) -> str:
+    """Build a minimal document that satisfies validate_authored_document for the
+    supplied contract: it uses every source alias, renders each as an
+    evidence-bound figure, and cites the evidence ledger."""
+    sources = [
+        _clean(item.get("alias"))
+        for item in contract.get("sources", [])
+        if isinstance(item, dict) and _clean(item.get("alias"))
+    ]
+    evidence = [
+        _clean(item.get("alias"))
+        for item in contract.get("evidence", [])
+        if isinstance(item, dict) and _clean(item.get("alias"))
+    ]
+    ev = evidence[0] if evidence else ""
+    ev_attr = f' data-evidence="{ev}"' if ev else ' data-decoration="true"'
+    figures = "\n".join(
+        f'<figure data-source="{alias}"{ev_attr}>'
+        f'<svg viewBox="0 0 200 100" role="img" aria-label="stub visual {alias}">'
+        f'<rect x="10" y="10" width="60" height="70" fill="#3b6cb7"></rect></svg>'
+        f"<figcaption>Stub visual for {alias}.</figcaption></figure>"
+        for alias in sources
+    )
+    claim_attr = f' data-evidence="{ev}"' if ev else ""
+    return (
+        "<!doctype html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        "<title>Stub authored report</title>"
+        "<style>body{font:16px/1.6 system-ui,sans-serif;margin:2rem;color:#172033}"
+        "figure{margin:2rem 0}</style></head>"
+        "<body><main><h1>Stub authored report</h1>"
+        f"<p{claim_attr}>Deterministic end-to-end stub document.</p>"
+        f"{figures}</main>"
+        '<script type="application/json" data-dc-author-coverage>{"omitted":[]}</script>'
+        "</body></html>"
+    )
+
+
+class _StubAuthorLLM:
+    """Test double: yields the synthesized document on the first call and a
+    passing evidence review on every subsequent call."""
+
+    def __init__(self, contract: dict[str, Any]) -> None:
+        self._document = _synthesize_stub_document(contract)
+        self._calls = 0
+
+    async def stream_turn(self, messages, *, system, tools, **kwargs):
+        response = (
+            self._document
+            if self._calls == 0
+            else json.dumps({"status": "pass", "findings": []})
+        )
+        self._calls += 1
+        yield TextDeltaEvent(text=response)
+
+
 async def _author_creative_document(
     storyboard: dict[str, Any],
     *,
@@ -1309,6 +1378,11 @@ async def _author_creative_document(
         )
     system, prompt = build_creative_author_prompt(dossier)
     record["prompt_sha256"] = hashlib.sha256((system + "\n" + prompt).encode("utf-8")).hexdigest()
+    # E2E test seam: swap the real provider for a deterministic stub. The stub is
+    # built from the resolved contract so its output passes the same structural
+    # gate every other caller must clear. Non-test callers never reach this.
+    if _visual_author_e2e_stub_enabled():
+        llm = _StubAuthorLLM(contract)
     max_passes = int(cfg.get("max_repair_passes", 0) or 0)
     max_prompt_chars = cfg["max_repair_prompt_chars"]
 

@@ -140,7 +140,7 @@ test('deletes an independent chat from the session directory', async ({ page }) 
 
   await page.goto('/chat')
   await page.getByRole('button', { name: 'Delete Disposable chat', exact: true }).click()
-  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await page.getByRole('button', { name: 'Delete all', exact: true }).click()
 
   await expect(page.getByText('Disposable chat')).toHaveCount(0)
   expect(deleted).toBe(true)
