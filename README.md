@@ -63,7 +63,7 @@ This chain improves traceability from a published claim back to its evidence and
 
 ### Skill library
 
-- Governed workflow skills: `structured_eda`, `survey_analytics`, `insight_validation`, `analysis_review`, `report_design`, `artifacts`, and `visualization`, alongside the `dataclaw_data_science` router (in `dataclaw.md`) and the compact `data_profiling`, `notebook_report`, and `sql_analyst` paths.
+- Governed workflow skills: `structured_eda`, `survey_analytics`, `segmentation`, `insight_validation`, `analysis_review`, `report_design`, `artifacts`, and `visualization`, alongside the `dataclaw_data_science` router (in `dataclaw.md`) and the compact `data_profiling`, `notebook_report`, and `sql_analyst` paths.
 - The reporting and analysis skills — `report_design`, `structured_eda`, `visualization`, `artifacts`, and `dataclaw_data_science` — are tuned for the governed workflow, and the standalone `dashboarding` skill is retired, its guidance folded into `report_design` and `visualization`.
 - Skills are installed from `skill-library/`. OpenClaw tool-manifest installation and skill synchronization are separate operations.
 
@@ -212,7 +212,7 @@ Navigate to **Projects** in the sidebar and create a new project. Each project g
 
 ### 4. Install the analysis and reporting skills you need
 
-Open **Skills** to browse the bundled Skill Library. For the governed Release 3 path, install `structured_eda`, `insight_validation`, and `analysis_review`; add `survey_analytics` for designed-sample survey, poll, questionnaire, panel, or survey-verbatim work; add `report_design` and `artifacts` when the session will publish a report or report-like dashboard, and add `visualization` when notebook charting or visual-evidence preparation is needed.
+Open **Skills** to browse the bundled Skill Library. For the governed Release 3 path, install `structured_eda`, `insight_validation`, and `analysis_review`; add `survey_analytics` for designed-sample survey, poll, questionnaire, panel, or survey-verbatim work; add `segmentation` for grouping a population into decision-serving segments, personas, or value/risk tiers; add `report_design` and `artifacts` when the session will publish a report or report-like dashboard, and add `visualization` when notebook charting or visual-evidence preparation is needed.
 
 Installed skills become available to direct LLM sessions, subject to the project or session Scope selection. When OpenClaw is active, the Skills page also offers to synchronize each installed skill to the Dataclaw OpenClaw extension. Skill synchronization is separate from reinstalling the OpenClaw tool manifest.
 
