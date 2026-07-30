@@ -28,9 +28,13 @@ class DataPlugin:
     name = "dataclaw-data"
     depends_on: list[str] = []
 
+    @staticmethod
+    def _apply_config(config) -> None:
+        set_plugin_cfg(config.plugins.get("data", {}))
+
     def register(self, ctx: PluginContext) -> None:
         # Pass plugin config to tools (max_query_rows, etc.)
-        set_plugin_cfg(ctx.config.plugins.get("data", {}))
+        self._apply_config(ctx.config)
 
         # Register API router
         ctx.include_api_router(data_router, prefix="/data", tags=["data"])
@@ -143,5 +147,15 @@ class DataPlugin:
                     description="Maximum rows returned by data_query_data",
                     default=500,
                 ),
+                PluginConfigField(
+                    name="max_notebook_rows",
+                    field_type="int",
+                    label="Max Notebook Rows",
+                    description="Maximum rows materialized by one notebook data request",
+                    default=10_000,
+                ),
             ],
         )
+
+    def on_config_update(self, config) -> None:
+        self._apply_config(config)

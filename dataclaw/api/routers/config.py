@@ -38,6 +38,8 @@ async def get_config(request: Request) -> dict[str, Any]:
 @router.patch("")
 async def update_config(updates: dict[str, Any], request: Request) -> dict[str, Any]:
     """Merge updates into the config file and hot-reload agent if backend changed."""
+    import asyncio
+
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -53,21 +55,41 @@ async def update_config(updates: dict[str, Any], request: Request) -> dict[str, 
 
     # Refresh the in-memory DataclawConfig snapshot so /api/providers reflects
     # the new backend selections (the providers router reads app.state.config).
+    updated_config: DataclawConfig | None = None
     try:
-        request.app.state.config = DataclawConfig(**raw)
+        updated_config = DataclawConfig(**raw)
+        request.app.state.config = updated_config
     except Exception:
         logger.exception("Failed to refresh app.state.config after PATCH")
+
+    if updated_config is not None:
+        await asyncio.to_thread(_hot_reload_plugins, request, updated_config)
 
     # Hot-reload providers from updated config. Some factories (notably
     # gbrain memory in `location=new` mode) shell out to subprocesses
     # during construction, which would block the event loop if run
     # inline — push them to a worker thread.
-    import asyncio
     await asyncio.to_thread(_hot_reload_agent, request)
     await asyncio.to_thread(_hot_reload_memory, request)
     await asyncio.to_thread(_hot_reload_compaction, request)
 
     return {"status": "updated"}
+
+
+def _hot_reload_plugins(request: Request, config: DataclawConfig) -> None:
+    """Notify plugins that support live configuration updates."""
+    for plugin in getattr(request.app.state, "plugins_list", []):
+        callback = getattr(plugin, "on_config_update", None)
+        if not callable(callback):
+            continue
+        try:
+            callback(config)
+            logger.info("Hot-reloaded plugin config: %s", plugin.name)
+        except Exception:
+            logger.exception(
+                "Failed to hot-reload plugin config: %s",
+                getattr(plugin, "name", type(plugin).__name__),
+            )
 
 
 def _hot_reload_agent(request: Request) -> None:
@@ -171,6 +193,7 @@ def _mask_secrets_recursive(d: dict) -> None:
 
 
 _SECRET_KEY_PATTERNS = {"api_key", "token", "secret", "password"}
+_EXACT_SECRET_KEYS = {"kaggle_key"}
 
 
 def _strip_masked_secrets(updates: dict) -> None:
@@ -194,7 +217,9 @@ def _strip_masked_recursive(d: dict) -> None:
 
 def _is_secret_key(key: str) -> bool:
     key_lower = key.lower()
-    return any(p in key_lower for p in _SECRET_KEY_PATTERNS)
+    return key_lower in _EXACT_SECRET_KEYS or any(
+        pattern in key_lower for pattern in _SECRET_KEY_PATTERNS
+    )
 
 
 def _is_masked(val: str) -> bool:

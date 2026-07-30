@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,25 +13,31 @@ import duckdb
 
 from dataclaw.config.paths import plugin_data_dir
 
+_registry_lock = threading.RLock()
+
 
 def _datasets_file() -> Path:
     return plugin_data_dir("data") / "datasets.json"
 
 
 def read_datasets() -> list[dict[str, Any]]:
-    path = _datasets_file()
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    with _registry_lock:
+        path = _datasets_file()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
 
 def write_datasets(datasets: list[dict[str, Any]]) -> None:
-    path = _datasets_file()
-    path.write_text(json.dumps(datasets, indent=2, default=str), encoding="utf-8")
+    with _registry_lock:
+        path = _datasets_file()
+        pending = path.with_suffix(f"{path.suffix}.tmp")
+        pending.write_text(json.dumps(datasets, indent=2, default=str), encoding="utf-8")
+        pending.replace(path)
 
 
 def find_dataset(dataset_id: str) -> dict[str, Any]:
@@ -47,66 +54,164 @@ def create_dataset(
     connection: str,
     description: str = "",
 ) -> dict[str, Any]:
-    datasets = read_datasets()
-    ds_id = str(uuid.uuid4())[:8]
+    dataset = _build_dataset(
+        dataset_id=str(uuid.uuid4())[:8],
+        name=name,
+        ds_type=ds_type,
+        connection=connection,
+        description=description,
+    )
+    with _registry_lock:
+        datasets = read_datasets()
+        datasets.append(dataset)
+        write_datasets(datasets)
+        return dataset
+
+
+def upsert_dataset(
+    *,
+    name: str,
+    ds_type: str,
+    connection: str,
+    description: str = "",
+    dataset_id: str | None = None,
+) -> dict[str, Any]:
+    """Create or refresh a dataset without duplicating the same connection."""
+    connection_key = _connection_key(ds_type, connection)
+    with _registry_lock:
+        datasets = read_datasets()
+        existing_index = next(
+            (
+                index
+                for index, dataset in enumerate(datasets)
+                if dataset_id and dataset.get("id") == dataset_id
+            ),
+            None,
+        )
+        if existing_index is None:
+            existing_index = next(
+                (
+                    index
+                    for index, dataset in enumerate(datasets)
+                    if dataset.get("type") == ds_type
+                    and _connection_key(ds_type, str(dataset.get("connection", "")))
+                    == connection_key
+                ),
+                None,
+            )
+        existing = datasets[existing_index] if existing_index is not None else None
+
+    dataset = _build_dataset(
+        dataset_id=str(existing["id"]) if existing else str(uuid.uuid4())[:8],
+        name=name,
+        ds_type=ds_type,
+        connection=connection,
+        description=description,
+        created_at=existing.get("created_at") if existing else None,
+    )
+
+    with _registry_lock:
+        datasets = read_datasets()
+        # Re-resolve after introspection in case another registration completed
+        # while the file scan was running.
+        existing_index = next(
+            (
+                index
+                for index, current in enumerate(datasets)
+                if current.get("id") == dataset["id"]
+                or (
+                    current.get("type") == ds_type
+                    and _connection_key(
+                        ds_type,
+                        str(current.get("connection", "")),
+                    )
+                    == connection_key
+                )
+            ),
+            None,
+        )
+        if existing_index is None:
+            datasets.append(dataset)
+        else:
+            current = datasets[existing_index]
+            dataset["id"] = current["id"]
+            dataset["created_at"] = current.get("created_at") or dataset["created_at"]
+            datasets[existing_index] = dataset
+        write_datasets(datasets)
+        return dataset
+
+
+def _build_dataset(
+    *,
+    dataset_id: str,
+    name: str,
+    ds_type: str,
+    connection: str,
+    description: str,
+    created_at: str | None = None,
+) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
-
     tables = _introspect_tables(ds_type, connection)
-
-    dataset: dict[str, Any] = {
-        "id": ds_id,
+    return {
+        "id": dataset_id,
         "name": name,
         "type": ds_type,
         "connection": connection,
         "description": description,
         "status": "connected" if tables else "error",
         "tables": tables or [],
-        "created_at": now,
+        "created_at": created_at or now,
         "updated_at": now,
     }
-    datasets.append(dataset)
-    write_datasets(datasets)
-    return dataset
+
+
+def _connection_key(ds_type: str, connection: str) -> str:
+    if ds_type in ("local_file", "csv", "parquet"):
+        return str(Path(connection).expanduser().resolve(strict=False))
+    return connection
 
 
 def update_dataset_fields(dataset_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     """Update fields on an existing dataset."""
-    datasets = read_datasets()
-    for ds in datasets:
-        if ds.get("id") == dataset_id:
-            for key, value in updates.items():
-                if key not in ("id", "created_at", "tables") and value is not None:
-                    ds[key] = value
-            ds["updated_at"] = datetime.now(timezone.utc).isoformat()
-            # Re-introspect if connection changed
-            if "connection" in updates or "type" in updates:
-                tables = _introspect_tables(ds.get("type", ""), ds.get("connection", ""))
-                ds["tables"] = tables or []
-                ds["status"] = "connected" if tables else "error"
-            write_datasets(datasets)
-            return ds
+    with _registry_lock:
+        datasets = read_datasets()
+        for ds in datasets:
+            if ds.get("id") == dataset_id:
+                for key, value in updates.items():
+                    if key not in ("id", "created_at", "tables") and value is not None:
+                        ds[key] = value
+                ds["updated_at"] = datetime.now(timezone.utc).isoformat()
+                # Re-introspect if connection changed
+                if "connection" in updates or "type" in updates:
+                    tables = _introspect_tables(ds.get("type", ""), ds.get("connection", ""))
+                    ds["tables"] = tables or []
+                    ds["status"] = "connected" if tables else "error"
+                write_datasets(datasets)
+                return ds
     raise ValueError(f"Dataset not found: {dataset_id}")
 
 
 def delete_dataset(dataset_id: str) -> bool:
-    datasets = read_datasets()
-    filtered = [ds for ds in datasets if ds.get("id") != dataset_id]
-    if len(filtered) == len(datasets):
-        return False
-    write_datasets(filtered)
-    return True
+    with _registry_lock:
+        datasets = read_datasets()
+        filtered = [ds for ds in datasets if ds.get("id") != dataset_id]
+        if len(filtered) == len(datasets):
+            return False
+        write_datasets(filtered)
+        return True
 
 
 def refresh_dataset(dataset_id: str) -> dict[str, Any]:
-    datasets = read_datasets()
-    for ds in datasets:
-        if ds.get("id") == dataset_id:
-            tables = _introspect_tables(ds.get("type", ""), ds.get("connection", ""))
-            ds["tables"] = tables or []
-            ds["status"] = "connected" if tables else "error"
-            ds["updated_at"] = datetime.now(timezone.utc).isoformat()
-            write_datasets(datasets)
-            return ds
+    with _registry_lock:
+        datasets = read_datasets()
+        for ds in datasets:
+            if ds.get("id") == dataset_id:
+                tables = _introspect_tables(ds.get("type", ""), ds.get("connection", ""))
+                ds["tables"] = tables or []
+                ds["status"] = "connected" if tables else "error"
+                ds["updated_at"] = datetime.now(timezone.utc).isoformat()
+                write_datasets(datasets)
+                return ds
     raise ValueError(f"Dataset not found: {dataset_id}")
 
 

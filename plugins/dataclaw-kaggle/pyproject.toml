@@ -5,7 +5,7 @@ description = "Dataclaw plugin — Kaggle competitions, datasets, and submission
 requires-python = ">=3.12"
 dependencies = [
     "dataclaw",
-    "kaggle>=1.6",
+    "kaggle>=1.8.3",
 ]
 
 [project.entry-points."dataclaw.plugins"]

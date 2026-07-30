@@ -379,6 +379,13 @@ import dataclaw_data
 df = dataclaw_data.get_dataframe("dataset_id", table_name="query_name")
 ```
 
+Notebook dataset reads are authorized against the active chat session. Omitting
+`n_rows` streams the full result as Parquet; passing `n_rows` requests a preview
+capped by `plugins.data.max_notebook_rows` (default `10000`). For large datasets,
+prefer selective SQL over loading an entire wide table. DataFrames expose
+`df.attrs["dataclaw_access_mode"]`, `df.attrs["dataclaw_truncated"]`, and
+`df.attrs["dataclaw_row_limit"]`.
+
 ### Auto Mode
 
 A toggle in the chat header that lets the agent run autonomously without waiting for the user to type "go" between turns. After every assistant turn, if the agent didn't ask a question and the auto-turn budget isn't exhausted, the loop fires another turn automatically with a synthetic "continue" prompt.
@@ -411,7 +418,11 @@ Adding or removing tools triggers a drift banner on the OpenClaw bridge install 
 
 ### Kaggle Integration
 
-The `dataclaw-kaggle` plugin wires up the Kaggle API end-to-end. Configure your Kaggle username + API key on the Config page (`plugins.kaggle.kaggle_username` / `plugins.kaggle.kaggle_key`), then the agent gets:
+The `dataclaw-kaggle` plugin wires up the Kaggle API end-to-end. Configure the
+token from Kaggle's **Generate New Token** flow on the Config page
+(`plugins.kaggle.kaggle_api_token`). Legacy `kaggle.json` username + key
+credentials remain supported through `plugins.kaggle.kaggle_username` and
+`plugins.kaggle.kaggle_key`. The agent then gets:
 
 - `list_competitions`, `competition_details`, `leaderboard`, `download_competition`
 - `search_datasets`, `download_dataset`
@@ -449,8 +460,11 @@ All runtime data under `~/.dataclaw/` (override with `$DATACLAW_HOME`):
 | `DATACLAW_PORT` | `app.port` | `8000` |
 | `DATACLAW_TOKEN` | `plugins.openclaw.token` | `dataclaw-local` |
 | `DATACLAW_OPENCLAW_URL` | `plugins.openclaw.url` | `http://127.0.0.1:18789` |
+| `KAGGLE_API_TOKEN` | `plugins.kaggle.kaggle_api_token` | |
+| `KAGGLE_USERNAME` / `KAGGLE_KEY` | `plugins.kaggle.kaggle_username` / `plugins.kaggle.kaggle_key` | Legacy credentials |
 
-Config changes to the agent backend are **hot-reloaded** — no server restart needed.
+Config changes to the agent backend and supported plugin integrations are
+**hot-reloaded** — no server restart needed.
 
 ---
 

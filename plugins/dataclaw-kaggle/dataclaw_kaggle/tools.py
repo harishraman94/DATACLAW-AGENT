@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
 
 from dataclaw.config.paths import plugin_data_dir
 
-from dataclaw_kaggle.client import run_kaggle, get_config
+from dataclaw_kaggle.client import get_auth_config, run_kaggle
 from dataclaw_kaggle import registry
 
 logger = logging.getLogger(__name__)
@@ -25,25 +26,31 @@ def set_plugin_cfg(cfg: dict[str, Any]) -> None:
 
 
 def _creds() -> dict[str, str]:
-    u, k = get_config(_plugin_cfg)
-    return {"username": u, "key": k}
+    return get_auth_config(_plugin_cfg)
 
 
 def _download_root() -> Path:
     custom = _plugin_cfg.get("download_dir", "")
     if custom:
-        return Path(custom)
-    return plugin_data_dir("kaggle")
+        configured = Path(custom).expanduser()
+        if not configured.is_absolute():
+            configured = plugin_data_dir("kaggle") / configured
+        return configured.resolve()
+    return plugin_data_dir("kaggle").resolve()
 
 
 def _competition_dir(slug: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", slug):
+        raise ValueError(f"Invalid Kaggle competition slug: {slug!r}")
     d = _download_root() / "competitions" / slug
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def _dataset_dir(ref: str) -> Path:
-    safe = ref.replace("/", "_")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", ref).strip("._")
+    if not safe:
+        raise ValueError(f"Invalid Kaggle dataset reference: {ref!r}")
     d = _download_root() / "datasets" / safe
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -131,41 +138,107 @@ def _extract_zips_in_dir(dest: Path) -> list[str]:
     return extracted
 
 
-def _register_as_dataclaw_dataset(name: str, path: str, description: str) -> str | None:
-    """Register a downloaded directory as a dataclaw-data dataset. Returns the dataset ID."""
+def _register_as_dataclaw_dataset(
+    name: str,
+    path: str,
+    description: str,
+    existing_dataset_id: str | None = None,
+) -> str | None:
+    """Register or refresh a Dataclaw dataset and return its stable ID."""
     if not _auto_register():
         return None
-    try:
-        from dataclaw_data.registry import create_dataset
-        ds = create_dataset(
-            name=name,
-            ds_type="local_file",
-            connection=path,
-            description=description,
-        )
-        return ds.get("id")
-    except Exception:
-        return None
+    from dataclaw_data.registry import upsert_dataset
+
+    ds = upsert_dataset(
+        name=name,
+        ds_type="local_file",
+        connection=path,
+        description=description,
+        dataset_id=existing_dataset_id,
+    )
+    return ds.get("id")
 
 
-async def _enable_dataset_for_session(dataset_id: str, session_id: str) -> None:
+async def _enable_dataset_for_session(dataset_id: str, session_id: str) -> bool:
     """Append a newly created dataset ID to the session's datasetIds allowlist."""
     if not dataset_id or not session_id:
-        return
+        return False
+
+    from dataclaw.storage.sessions import get_session, update_session
+
+    session = await get_session(session_id)
+    if session is None:
+        raise ValueError(f"Session not found: {session_id}")
+    current_ids = session.get("datasetIds")
+    if current_ids is None:
+        # None means "all datasets allowed" — no action needed.
+        return True
+    if dataset_id not in current_ids:
+        updated_ids = [*current_ids, dataset_id]
+        updated = await update_session(session_id, {"datasetIds": updated_ids})
+        if updated is None:
+            raise RuntimeError(f"Failed to update session: {session_id}")
+    return True
+
+
+async def _register_downloaded_dataset(
+    *,
+    name: str,
+    path: str,
+    description: str,
+    existing_dataset_id: str | None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Register a download off-loop and return user-visible outcome metadata."""
     try:
-        from dataclaw.storage.sessions import get_session, update_session
-        session = await get_session(session_id)
-        if session is None:
-            return
-        current_ids = session.get("datasetIds")
-        if current_ids is None:
-            # None means "all datasets allowed" — no action needed
-            return
-        if dataset_id not in current_ids:
-            current_ids.append(dataset_id)
-            await update_session(session_id, {"datasetIds": current_ids})
-    except Exception:
-        pass
+        dataset_id = await asyncio.to_thread(
+            _register_as_dataclaw_dataset,
+            name=name,
+            path=path,
+            description=description,
+            existing_dataset_id=existing_dataset_id,
+        )
+    except Exception as exc:
+        logger.exception("Failed to register Kaggle download %s", path)
+        return None, {
+            "dataset_registration": "failed",
+            "dataset_registration_error": str(exc),
+        }
+    if dataset_id:
+        return dataset_id, {"dataset_registration": "registered"}
+    return None, {"dataset_registration": "disabled"}
+
+
+async def _attach_dataset_to_session(
+    dataset_id: str | None,
+    session_id: str,
+) -> dict[str, Any]:
+    """Attach a dataset to a session and expose any partial failure."""
+    if not dataset_id:
+        return {"session_attachment": "not_applicable"}
+    if not session_id:
+        return {"session_attachment": "not_requested"}
+    try:
+        await _enable_dataset_for_session(dataset_id, session_id)
+    except Exception as exc:
+        logger.exception(
+            "Failed to enable dataset %s for session %s",
+            dataset_id,
+            session_id,
+        )
+        return {
+            "session_attachment": "failed",
+            "session_attachment_error": str(exc),
+        }
+    return {"session_attachment": "attached"}
+
+
+def _session_id_from_kwargs(kwargs: dict[str, Any]) -> str:
+    """Return trusted injected context, with legacy direct-call compatibility."""
+    return str(
+        kwargs.get("dataclaw_session_id")
+        or kwargs.get("session_id")
+        or ""
+    )
 
 
 def _extract_slug(ref: str) -> str:
@@ -300,7 +373,8 @@ async def kaggle_download_competition(
     existing = registry.get_competition(competition)
     if _is_valid_cached_download(existing) and not force:
         cached_path = Path(existing["download_path"])
-        if _extract_zips_in_dir(cached_path):
+        extracted = await asyncio.to_thread(_extract_zips_in_dir, cached_path)
+        if extracted:
             refreshed_files = [f.name for f in cached_path.iterdir() if f.is_file()]
             existing = registry.record_download(
                 kind="competitions",
@@ -309,12 +383,38 @@ async def kaggle_download_competition(
                 files=refreshed_files,
                 dataclaw_dataset_id=existing.get("dataclaw_dataset_id"),
             )
+        dc_id = existing.get("dataclaw_dataset_id")
+        registration: dict[str, Any] = {"dataset_registration": "existing"}
+        if extracted or not dc_id:
+            registered_id, registration = await _register_downloaded_dataset(
+                name=f"Kaggle: {competition}",
+                path=str(cached_path),
+                description=(
+                    f"Competition data from https://www.kaggle.com/c/{competition}"
+                ),
+                existing_dataset_id=dc_id,
+            )
+            if registered_id:
+                dc_id = registered_id
+                existing = registry.record_download(
+                    kind="competitions",
+                    key=competition,
+                    download_path=str(cached_path),
+                    files=existing.get("files", []),
+                    dataclaw_dataset_id=dc_id,
+                )
+        attachment = await _attach_dataset_to_session(
+            dc_id,
+            _session_id_from_kwargs(kwargs),
+        )
         return {
             "status": "already_downloaded",
             "competition": competition,
             "download_path": existing["download_path"],
             "files": existing.get("files", []),
-            "dataclaw_dataset_id": existing.get("dataclaw_dataset_id"),
+            "dataclaw_dataset_id": dc_id,
+            **registration,
+            **attachment,
         }
 
     try:
@@ -346,7 +446,7 @@ async def kaggle_download_competition(
 
     # Unpack any zip files left on disk (Kaggle's competition API never unzips,
     # and dataset_download_files leaves stale zips when not re-fetched).
-    _extract_zips_in_dir(dest)
+    await asyncio.to_thread(_extract_zips_in_dir, dest)
 
     # List downloaded files
     downloaded_files = [f.name for f in dest.iterdir() if f.is_file()]
@@ -358,13 +458,14 @@ async def kaggle_download_competition(
     })
 
     # Auto-register with dataclaw-data
-    dc_id = _register_as_dataclaw_dataset(
+    dc_id, registration = await _register_downloaded_dataset(
         name=f"Kaggle: {competition}",
         path=str(dest),
         description=f"Competition data from https://www.kaggle.com/c/{competition}",
+        existing_dataset_id=(existing or {}).get("dataclaw_dataset_id"),
     )
 
-    entry = registry.record_download(
+    registry.record_download(
         kind="competitions",
         key=competition,
         download_path=str(dest),
@@ -372,10 +473,10 @@ async def kaggle_download_competition(
         dataclaw_dataset_id=dc_id,
     )
 
-    # Enable the new dataset for the current session
-    if dc_id:
-        session_id = kwargs.get("session_id") or kwargs.get("dataclaw_session_id", "")
-        await _enable_dataset_for_session(dc_id, session_id)
+    attachment = await _attach_dataset_to_session(
+        dc_id,
+        _session_id_from_kwargs(kwargs),
+    )
 
     return {
         "status": "downloaded",
@@ -383,6 +484,8 @@ async def kaggle_download_competition(
         "download_path": str(dest),
         "files": downloaded_files,
         "dataclaw_dataset_id": dc_id,
+        **registration,
+        **attachment,
     }
 
 
@@ -414,7 +517,8 @@ async def kaggle_download_dataset(
     existing = registry.get_dataset(dataset)
     if _is_valid_cached_download(existing) and not force:
         cached_path = Path(existing["download_path"])
-        if _extract_zips_in_dir(cached_path):
+        extracted = await asyncio.to_thread(_extract_zips_in_dir, cached_path)
+        if extracted:
             refreshed_files = [f.name for f in cached_path.iterdir() if f.is_file()]
             existing = registry.record_download(
                 kind="datasets",
@@ -423,12 +527,36 @@ async def kaggle_download_dataset(
                 files=refreshed_files,
                 dataclaw_dataset_id=existing.get("dataclaw_dataset_id"),
             )
+        dc_id = existing.get("dataclaw_dataset_id")
+        registration = {"dataset_registration": "existing"}
+        if extracted or not dc_id:
+            registered_id, registration = await _register_downloaded_dataset(
+                name=f"Kaggle: {dataset}",
+                path=str(cached_path),
+                description=f"Dataset from https://www.kaggle.com/datasets/{dataset}",
+                existing_dataset_id=dc_id,
+            )
+            if registered_id:
+                dc_id = registered_id
+                existing = registry.record_download(
+                    kind="datasets",
+                    key=dataset,
+                    download_path=str(cached_path),
+                    files=existing.get("files", []),
+                    dataclaw_dataset_id=dc_id,
+                )
+        attachment = await _attach_dataset_to_session(
+            dc_id,
+            _session_id_from_kwargs(kwargs),
+        )
         return {
             "status": "already_downloaded",
             "dataset": dataset,
             "download_path": existing["download_path"],
             "files": existing.get("files", []),
-            "dataclaw_dataset_id": existing.get("dataclaw_dataset_id"),
+            "dataclaw_dataset_id": dc_id,
+            **registration,
+            **attachment,
         }
 
     try:
@@ -444,7 +572,7 @@ async def kaggle_download_dataset(
         return {"status": "error", "error": str(exc)}
 
     # Catch the case where the SDK left a stale zip (already-cached file path).
-    _extract_zips_in_dir(dest)
+    await asyncio.to_thread(_extract_zips_in_dir, dest)
 
     downloaded_files = [f.name for f in dest.iterdir() if f.is_file()]
 
@@ -455,10 +583,11 @@ async def kaggle_download_dataset(
     })
 
     # Auto-register with dataclaw-data
-    dc_id = _register_as_dataclaw_dataset(
+    dc_id, registration = await _register_downloaded_dataset(
         name=f"Kaggle: {dataset}",
         path=str(dest),
         description=f"Dataset from https://www.kaggle.com/datasets/{dataset}",
+        existing_dataset_id=(existing or {}).get("dataclaw_dataset_id"),
     )
 
     registry.record_download(
@@ -469,10 +598,10 @@ async def kaggle_download_dataset(
         dataclaw_dataset_id=dc_id,
     )
 
-    # Enable the new dataset for the current session
-    if dc_id:
-        session_id = kwargs.get("session_id") or kwargs.get("dataclaw_session_id", "")
-        await _enable_dataset_for_session(dc_id, session_id)
+    attachment = await _attach_dataset_to_session(
+        dc_id,
+        _session_id_from_kwargs(kwargs),
+    )
 
     return {
         "status": "downloaded",
@@ -480,6 +609,8 @@ async def kaggle_download_dataset(
         "download_path": str(dest),
         "files": downloaded_files,
         "dataclaw_dataset_id": dc_id,
+        **registration,
+        **attachment,
     }
 
 
