@@ -55,21 +55,25 @@ class PlansPlugin:
                         "type": "string",
                         "description": (
                             "Required detailed Markdown review document for plan.md — the substance a lead reviews, "
-                            "richer than the compact steps. Do not leave this empty. It must cover, as clearly "
-                            "labeled sections:\n"
-                            "- Objective and what is already known from prior inspection — cite the initial hypothesis "
-                            "ledger from propose_eda_hypotheses; if you recorded none, say so rather than citing a "
-                            "ledger you never created.\n"
+                            "richer than the compact steps. Do not leave this empty. Write in plain analyst "
+                            "prose — no self-praise adjectives, filler transitions, heading-restating bold "
+                            "lead-ins, or reflexive three-item lists; every sentence must be checkable or "
+                            "actionable. For substantial work, open with a one-line provenance header "
+                            "(Provenance: playbooks=<names|none>; hypotheses=<hyp-ids|none recorded>), then cover "
+                            "these labeled sections (a quick-answer ask needs only a few lines):\n"
+                            "- Objective and what is already known from prior inspection — map each workstream to the "
+                            "hypotheses or questions it addresses.\n"
                             "- Method and rationale — the analytical approach chosen for the question type and data "
                             "shape, with the main alternatives considered and rejected (e.g. a causal design vs a "
-                            "predictive model); name the method playbook consulted, or state that none applied.\n"
+                            "predictive model).\n"
                             "- Assumptions, data limitations, and threats to validity, with how each is controlled "
                             "(leakage, confounding, selection bias, non-stationarity, multiple comparisons, "
                             "insufficient statistical power).\n"
                             "- Baseline, success threshold, and evaluation protocol appropriate to the data (e.g. "
                             "time-based or group-aware splits to avoid leakage).\n"
                             "- Grouped workstreams, explicit out-of-scope / non-goals, validation and QA checks, "
-                            "expected deliverables, risks or open questions, and execution order."
+                            "expected deliverables (a governed HTML report when the analysis is substantial or "
+                            "elaborate), risks or open questions, and execution order."
                         ),
                     },
                     "steps": {
