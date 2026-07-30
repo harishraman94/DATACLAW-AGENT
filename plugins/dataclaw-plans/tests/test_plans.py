@@ -689,14 +689,14 @@ async def test_planning_reasoning_hook_elevates_while_drafting_then_stops():
     state = {"session_id": sid}
 
     # Pre-plan (EDA + drafting turn): elevated.
-    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "medium"
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "high"
 
     # Drafted but awaiting approval (covers revisions): still elevated.
     r = await propose_plan(
         name="P", description="d", steps=[{"name": "s", "description": "d"}],
         plan_markdown="# Plan\n\n## QA\nCheck counts.", session_id=sid,
     )
-    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "medium"
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "high"
 
     # Approved → execution phase → not elevated.
     await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
@@ -720,7 +720,7 @@ async def test_planning_reasoning_hook_clears_stale_effort_after_mid_run_approva
     await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
 
     # State still carries the elevated effort from the earlier drafting turn.
-    out = await planning_reasoning_hook({"session_id": sid, "reasoning_effort": "medium"})
+    out = await planning_reasoning_hook({"session_id": sid, "reasoning_effort": "high"})
     assert out["reasoning_effort"] == ""
 
 

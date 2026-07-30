@@ -44,7 +44,7 @@ async def planning_reasoning_hook(state: AgentState) -> AgentState:
     propose_plan auto-approves), so execution turns in that run are not left
     elevated by a value carried over from the drafting turn.
     """
-    configured = resolve("plugins.plans.reasoning_effort", "DATACLAW_PLANS_REASONING_EFFORT", "medium")
+    configured = resolve("plugins.plans.reasoning_effort", "DATACLAW_PLANS_REASONING_EFFORT", "high")
     desired = configured if (configured and _in_planning_phase(state.get("session_id", ""))) else ""
     if desired == (state.get("reasoning_effort") or ""):
         return state
