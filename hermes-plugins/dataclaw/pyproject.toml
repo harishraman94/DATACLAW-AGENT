@@ -1,0 +1,13 @@
+[project]
+name = "dataclaw-hermes-bridge"
+version = "0.1.0"
+description = "Hermes Agent plugin for governed Dataclaw tools"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]
+
+[project.entry-points."hermes_agent.plugins"]
+dataclaw = "dataclaw_hermes_bridge:register"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -53,4 +53,6 @@ ui/build/
 
 # Local-only planning, research, and documentation
 .local-planning/
-docs/
+docs/*
+!docs/hermes-runtime-plan.md
+!docs/hermes-runtime-implementation-spec.md
