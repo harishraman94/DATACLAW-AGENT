@@ -22,6 +22,11 @@ async def test_prompt_hook_adds_external_research_policy_once():
     assert "External Context Research" in updated["system_prompt"]
     assert "research-methodology-guided experiments" in updated["system_prompt"]
     assert "use validation feedback" in updated["system_prompt"]
+    assert "Research-step validation lifecycle" in updated["system_prompt"]
+    assert "request_analysis_review" in updated["system_prompt"]
+    assert "Do not mark the overall plan completed" in updated["system_prompt"]
+    assert "ready_for_validation" in updated["system_prompt"]
+    assert "accept_gate_risk" in updated["system_prompt"]
     assert updated_again["system_prompt"].count(EXTERNAL_RESEARCH_FIRST_PROMPT.strip()) == 1
 
 
@@ -49,6 +54,8 @@ def test_prioritize_external_research_inserts_first_step_for_analytical_plan():
     assert revised["steps"][0]["name"] == "External context and data discovery"
     assert "ablations against a provided-data-only baseline" in revised["steps"][0]["description"]
     assert "promote, tune, combine, or reject" in revised["steps"][0]["description"]
+    assert "request analysis review" in revised["steps"][0]["description"]
+    assert revised["steps"][0]["ready_for_validation"] is False
     assert revised["steps"][1]["name"] == "EDA validation"
 
 

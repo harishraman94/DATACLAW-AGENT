@@ -28,6 +28,20 @@ _delegate_to_subagent: Any = None
 _llm_provider: Any = None
 
 
+def _research_validation_guidance() -> dict[str, Any]:
+    """Describe the plan lifecycle that should follow durable research output."""
+    return {
+        "required_sequence": [
+            "Record the current plan step's summary, citations, caveats, and output paths.",
+            "Mark only the current step completed; do not finalize the plan or set ready_for_validation in the same update.",
+            "Request analysis review for the completed plan_step_id.",
+            "Resolve required findings and rerun review, or accept gate risk only with explicit user approval and rationale.",
+            "Set ready_for_validation only after the review passes or the risk has audited acceptance.",
+        ],
+        "plan_completion": "Finalize the overall plan only after every required step is ready for validation.",
+    }
+
+
 def set_plugin_cfg(cfg: dict[str, Any]) -> None:
     global _plugin_cfg
     _plugin_cfg = cfg or {}
@@ -149,6 +163,7 @@ async def context_research_save_to_okf(
         "path": "notes/external_context.md",
         "saved_findings": len(findings),
         "evidence_note": "External context is cited and evidence-labeled; verify technical findings against the dataset before relying on them.",
+        "validation_guidance": _research_validation_guidance(),
     }
 
 
@@ -205,6 +220,7 @@ async def context_research_save_program_to_okf(
         "path": "notes/research_program.md",
         "hypotheses": len(program.get("hypotheses", [])),
         "experiment_branches": len(program.get("experiment_branches", [])),
+        "validation_guidance": _research_validation_guidance(),
     }
 
 
@@ -239,6 +255,7 @@ async def context_research_run_parallel_experiments(
         "tasks_dispatched": len(results),
         "results": results,
         "next_step": "Compare subagent recommendations, promote only branches with validated lift and acceptable leakage risk.",
+        "validation_guidance": _research_validation_guidance(),
     }
 
 

@@ -299,6 +299,8 @@ async def test_summarize_and_save_findings_to_okf(monkeypatch, survey_dataset):
     bundle = generate_bundle(survey_dataset["id"])
     saved = await context_research_save_to_okf(bundle_id=bundle["id"], dataset_id=survey_dataset["id"])
     assert saved["saved_findings"] == 1
+    assert "Request analysis review" in " ".join(saved["validation_guidance"]["required_sequence"])
+    assert "ready for validation" in saved["validation_guidance"]["plan_completion"]
 
     external_context = Path(bundle["path"]) / "notes" / "external_context.md"
     text = external_context.read_text(encoding="utf-8")
@@ -400,6 +402,8 @@ async def test_save_research_program_to_okf(monkeypatch, survey_dataset):
     )
 
     assert result["path"] == "notes/research_program.md"
+    assert "Request analysis review" in " ".join(result["validation_guidance"]["required_sequence"])
+    assert "ready for validation" in result["validation_guidance"]["plan_completion"]
     text = (Path(bundle["path"]) / "notes" / "research_program.md").read_text(encoding="utf-8")
     assert "Research Program" in text
     assert "https://github.com/example/churn-model" in text

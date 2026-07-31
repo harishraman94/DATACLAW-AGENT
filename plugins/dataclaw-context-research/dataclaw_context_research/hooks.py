@@ -21,6 +21,16 @@ For open-ended data science work, treat external context gathering as the first 
 - use validation feedback from each ablation to adjust later modeling branches instead of treating research as static decoration.
 
 Plans for experiments should place this external research and enrichment phase before EDA validation, baseline modeling, or parallel subagent experiments. Final modeling reports should include a methodology attribution table showing which research ideas were implemented, how they were translated into dataset-safe modeling choices, whether they improved metrics, and how the result changed the next model iteration. If relevant research already exists for the dataset or project, summarize and reuse it instead of repeating the same search.
+
+### Research-step validation lifecycle
+External research, OKF research notes, research programs, ablations, EDA, and modeling work can require an `analysis_review` gate. For each affected plan step, use this sequence:
+1. Record the concrete summary, citations, caveats, bundle paths, program IDs, and other outputs, then call `update_plan` to mark only that step `completed`. Do not mark the overall plan completed or set `ready_for_validation` in the same call.
+2. Call `request_analysis_review` with `scope="plan_step"` and the completed step's `plan_step_id`.
+3. Inspect and resolve required review findings, then rerun the review when the evidence changes. Use `accept_gate_risk` only when the user explicitly approves proceeding with a documented rationale.
+4. After the review gate passes or the risk has an audited acceptance, call `update_plan` to set that step's `ready_for_validation` to `true`.
+5. Mark the overall plan `completed` only after every required step is ready for validation.
+
+A successful context-research or OKF tool call is evidence for the review, not a review pass by itself. Never skip directly from saving research outputs to finalizing the plan.
 """
 
 RESEARCH_STEP_NAME = "External context and data discovery"
@@ -31,7 +41,10 @@ RESEARCH_STEP_DESCRIPTION = (
     "external data candidates and domain constraints, save durable findings to OKF "
     "when possible, translate research methodologies into dataset-safe modeling "
     "choices, require ablations against a provided-data-only baseline, and use "
-    "validation feedback to promote, tune, combine, or reject each branch."
+    "validation feedback to promote, tune, combine, or reject each branch. Record "
+    "citations, caveats, bundle paths, and program IDs before completing this step; "
+    "then request analysis review and mark it ready for validation only after the "
+    "gate passes or the user explicitly accepts the documented risk."
 )
 
 _RESEARCH_TERMS = (
@@ -141,6 +154,7 @@ def _new_research_step() -> dict[str, Any]:
         "name": RESEARCH_STEP_NAME,
         "description": RESEARCH_STEP_DESCRIPTION,
         "status": "not_started",
+        "ready_for_validation": False,
         "summary": "",
         "outputs": [],
     }
