@@ -38,6 +38,7 @@ def append_messages(
 class AgentState(TypedDict, total=False):
     # ── Identity ────────────────────────────────────────────────────────
     session_id: str
+    run_id: str
     project_id: str | None
     user_query: str
 

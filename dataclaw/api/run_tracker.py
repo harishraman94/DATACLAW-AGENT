@@ -20,6 +20,65 @@ logger = logging.getLogger(__name__)
 _FINISHED_RUN_TTL = 600  # 10 minutes
 _MAX_EVENTS = 10_000
 
+RunStatus = Literal[
+    "queued",
+    "running",
+    "waiting_approval",
+    "stopping",
+    "completed",
+    "failed",
+    "cancelled",
+    "unknown",
+    # Legacy terminal names retained for existing Direct/OpenClaw callers.
+    "finished",
+    "error",
+]
+LIVE_STATUSES = frozenset(
+    {"queued", "running", "waiting_approval", "stopping"}
+)
+TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "finished", "error"}
+)
+_RUN_TRANSITIONS: dict[str, set[str]] = {
+    "queued": {"running", "failed", "cancelled", "error", "finished"},
+    "running": {
+        "waiting_approval",
+        "stopping",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "finished",
+        "error",
+    },
+    "waiting_approval": {
+        "running",
+        "stopping",
+        "failed",
+        "cancelled",
+        "unknown",
+        "finished",
+        "error",
+    },
+    "stopping": {
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "finished",
+        "error",
+    },
+    "unknown": {"completed", "failed", "cancelled", "finished", "error"},
+}
+
+
+def is_live(status: str) -> bool:
+    return status in LIVE_STATUSES
+
+
+def is_terminal(status: str) -> bool:
+    return status in TERMINAL_STATUSES
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -29,7 +88,7 @@ def _now_iso() -> str:
 class RunState:
     run_id: str
     thread_id: str
-    status: Literal["running", "finished", "error"] = "running"
+    status: RunStatus = "running"
     events: list[tuple[int, str]] = field(default_factory=list)
     cursor: int = 0
     queued_messages: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
@@ -39,12 +98,18 @@ class RunState:
     last_event_at: str = field(default_factory=_now_iso)
     last_progress_at: str | None = None
     active_tool: dict[str, Any] | None = None
+    runtime: str = "direct"
+    runtime_run_id: str | None = None
+    runtime_session_id: str | None = None
+    usage: dict[str, Any] | None = None
     _waiters: list[asyncio.Event] = field(default_factory=list)
     _completion: asyncio.Event = field(default_factory=asyncio.Event)
+    _terminal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # Guardrail user-approval synchronization
     guardrail_approvals: dict[str, asyncio.Event] = field(default_factory=dict)
     guardrail_decisions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    guardrail_requests: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def append_event(self, event_str: str) -> int:
         """Append an event, notify all waiters, return cursor."""
@@ -111,6 +176,51 @@ class RunTracker:
             return -1
         return run.append_event(event_str)
 
+    def transition_run(self, thread_id: str, status: RunStatus) -> bool:
+        """Apply a validated live lifecycle transition.
+
+        Terminal states are immutable. Duplicate writes are idempotent.
+        """
+        run = self._runs.get(thread_id)
+        if run is None:
+            return False
+        if run.status == status:
+            return True
+        if is_terminal(run.status):
+            return False
+        if status not in _RUN_TRANSITIONS.get(run.status, set()):
+            return False
+        run.status = status
+        if is_terminal(status):
+            run.finished_at = time.monotonic()
+            run.active_tool = None
+            run._completion.set()
+            for waiter in run._waiters:
+                waiter.set()
+            run._waiters.clear()
+        return True
+
+    def set_runtime_metadata(
+        self,
+        thread_id: str,
+        *,
+        runtime: str | None = None,
+        runtime_run_id: str | None = None,
+        runtime_session_id: str | None = None,
+        usage: dict[str, Any] | None = None,
+    ) -> None:
+        run = self._runs.get(thread_id)
+        if run is None:
+            return
+        if runtime is not None:
+            run.runtime = runtime
+        if runtime_run_id is not None:
+            run.runtime_run_id = runtime_run_id
+        if runtime_session_id is not None:
+            run.runtime_session_id = runtime_session_id
+        if usage is not None:
+            run.usage = usage
+
     def start_tool(self, thread_id: str, call_id: str, name: str) -> None:
         """Record the currently executing tool for health/status reporting."""
         run = self._runs.get(thread_id)
@@ -156,26 +266,33 @@ class RunTracker:
             run.last_progress_at = _now_iso()
             run.active_tool = None
 
-    def finish_run(self, thread_id: str, status: Literal["finished", "error"] = "finished") -> None:
+    def finish_run(
+        self,
+        thread_id: str,
+        status: RunStatus = "finished",
+    ) -> None:
         """Mark a run as finished. Starts the TTL countdown for cleanup."""
         run = self._runs.get(thread_id)
         if run is None:
             return
-        run.status = status
-        run.finished_at = time.monotonic()
-        run.active_tool = None
-        run._completion.set()
-        # Wake up all tailers so they see the run is done
-        for w in run._waiters:
-            w.set()
-        run._waiters.clear()
+        if is_terminal(run.status):
+            return
+        if not self.transition_run(thread_id, status):
+            logger.warning(
+                "Rejected run transition: thread=%s %s -> %s",
+                thread_id,
+                run.status,
+                status,
+            )
+            return
         logger.info("Run %s: thread=%s run=%s", status, thread_id, run.run_id)
 
     def cancel_run(self, thread_id: str) -> bool:
         """Cancel a running task. Returns True if cancelled."""
         run = self._runs.get(thread_id)
-        if run is None or run.status != "running":
+        if run is None or not is_live(run.status):
             return False
+        self.transition_run(thread_id, "stopping")
         if run.task is not None:
             run.task.cancel()
         return True
@@ -187,7 +304,7 @@ class RunTracker:
     def queue_message(self, thread_id: str, text: str) -> bool:
         """Queue a message for the running agent loop. Returns False if no active run."""
         run = self._runs.get(thread_id)
-        if run is None or run.status != "running":
+        if run is None or not is_live(run.status):
             return False
         run.queued_messages.put_nowait(text)
         return True

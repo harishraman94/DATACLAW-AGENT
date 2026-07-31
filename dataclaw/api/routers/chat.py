@@ -14,14 +14,23 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from dataclaw.api.context import current_emitter, current_thread_id
-from dataclaw.api.run_tracker import RunState, get_run_tracker
+from dataclaw.api.context import (
+    current_emitter,
+    current_runtime_bundle,
+    current_thread_id,
+)
+from dataclaw.api.run_tracker import (
+    RunState,
+    get_run_tracker,
+    is_live,
+    is_terminal,
+)
 from dataclaw.capability_receipts import (
     build_capability_receipt,
     finish_capability_receipt,
@@ -33,6 +42,11 @@ from dataclaw.events.emitter import AgentEventEmitter
 _SSE_MEDIA_TYPE = "text/event-stream"
 from dataclaw.hooks.base import HookError
 from dataclaw.hooks.registry import HookRegistry
+from dataclaw.pending_actions import (
+    public_pending_actions,
+    register_guardrail_action,
+    resolve_guardrail_action,
+)
 from dataclaw.plugins.registry import ProviderRegistry
 from dataclaw.providers.llm.provider import PendingToolCall, TextDeltaEvent, ToolUseStartEvent, TurnCompleteEvent
 from dataclaw.providers.tool.llm_redact import redact_for_llm
@@ -185,6 +199,65 @@ async def _append_visual_artifacts(
 # ── Agent Background Task ──────────────────────────────────────────────────
 
 
+async def _terminalize_run(
+    thread_id: str,
+    *,
+    outcome: Literal["success", "failure", "cancelled"],
+    emitter: AgentEventEmitter,
+    assistant_text: str = "",
+    message_id: str | None = None,
+    error: str = "",
+    persist_success: bool = True,
+    emit_success_text: bool = False,
+) -> bool:
+    """Apply one terminal outcome and ignore every later terminal signal."""
+    tracker = get_run_tracker()
+    run = tracker.get_run(thread_id)
+    if run is None:
+        return False
+
+    async with run._terminal_lock:
+        if is_terminal(run.status):
+            return False
+        if outcome == "success":
+            resolved_message_id = message_id or f"asst-{run.run_id}"
+            if emit_success_text and assistant_text:
+                tracker.append_event(
+                    thread_id,
+                    emitter.text_message_start(resolved_message_id),
+                )
+                tracker.append_event(
+                    thread_id,
+                    emitter.text_delta(assistant_text, resolved_message_id),
+                )
+                tracker.append_event(
+                    thread_id,
+                    emitter.text_message_end(resolved_message_id),
+                )
+            if persist_success and assistant_text:
+                await sessions.append_message(
+                    thread_id,
+                    {
+                        "role": "assistant",
+                        "content": assistant_text,
+                        "messageId": resolved_message_id,
+                    },
+                )
+            tracker.append_event(thread_id, emitter.run_finished())
+            tracker.finish_run(thread_id)
+        elif outcome == "failure":
+            tracker.append_event(
+                thread_id,
+                emitter.run_error(error or "Agent run failed"),
+            )
+            tracker.append_event(thread_id, emitter.run_finished())
+            tracker.finish_run(thread_id, "error")
+        else:
+            tracker.append_event(thread_id, emitter.run_finished())
+            tracker.finish_run(thread_id, "cancelled")
+        return True
+
+
 async def _run_agent_loop(
     thread_id: str,
     run_id: str,
@@ -192,6 +265,7 @@ async def _run_agent_loop(
     user_query: str,
     providers: ProviderRegistry,
     hooks: HookRegistry,
+    runtime_manager: Any | None = None,
 ) -> None:
     """Run the agent loop as a background task. Emits events to the RunTracker."""
     tracker = get_run_tracker()
@@ -200,8 +274,9 @@ async def _run_agent_loop(
     def emit(event_str: str) -> None:
         tracker.append_event(thread_id, event_str)
 
-    current_thread_id.set(thread_id)
-    current_emitter.set(emitter)
+    thread_token = current_thread_id.set(thread_id)
+    emitter_token = current_emitter.set(emitter)
+    bundle_token = current_runtime_bundle.set(providers)
 
     emit(emitter.run_started())
     capability_receipt: dict[str, Any] | None = None
@@ -247,6 +322,7 @@ async def _run_agent_loop(
         # Run pipeline stages (hooks + providers) before agent call
         state: dict[str, Any] = {
             "session_id": thread_id,
+            "run_id": run_id,
             "project_id": project_id,
             "user_query": user_query,
             "messages": messages,
@@ -456,8 +532,6 @@ async def _run_agent_loop(
                             agent_text = state.get("metadata", {}).get("agent_text", "")
                             if not agent_text:
                                 agent_text = "".join(t for t in _text_chunks)
-                            if agent_text:
-                                await sessions.append_message(thread_id, {"role": "assistant", "content": agent_text, "messageId": f"asst-{msg_id}"})
                             # Bump the auto-mode turn counter so it survives page
                             # navigation. Only counts auto-driven turns — manual
                             # user messages don't drain the budget.
@@ -472,8 +546,13 @@ async def _run_agent_loop(
                                     logger.exception("Failed to bump autoTurnsUsed")
                             state = await hooks.run("postAgentMessageHook", state)
                             await persist_capability_receipt("completed")
-                            emit(emitter.run_finished())
-                            tracker.finish_run(thread_id)
+                            await _terminalize_run(
+                                thread_id,
+                                outcome="success",
+                                emitter=emitter,
+                                assistant_text=agent_text,
+                                message_id=f"asst-{msg_id}",
+                            )
                             return
 
             # Tool call path
@@ -505,42 +584,105 @@ async def _run_agent_loop(
 
                 # Track which user-approval calls were denied (not approved)
                 denied_ids: set[str] = set()
+                denied_decisions: dict[str, dict[str, Any]] = {}
 
                 # Handle user-approval guardrails: pause and wait for decision
                 run = tracker.get_run(thread_id)
                 for v in approval_verdicts:
                     call_id = v["tool_call_id"]
                     approval_id = f"guardrail-{uuid.uuid4()}"
+                    if run is None:
+                        denied_ids.add(call_id)
+                        denied_decisions[call_id] = {
+                            "approved": False,
+                            "feedback": "Approval is unavailable because the run is no longer active.",
+                        }
+                        continue
+
+                    approval_event = asyncio.Event()
+                    run.guardrail_approvals[approval_id] = approval_event
+                    original = _original_tool_calls.get(call_id, {})
+                    action = await register_guardrail_action(
+                        run,
+                        approval_id=approval_id,
+                        guardrail_id=v.get("guardrail_id"),
+                        tool_call_id=call_id,
+                        message=v.get("message", "Approval required"),
+                        severity=v.get("severity", "warning"),
+                        timeout_seconds=300,
+                        tool_name=original.get("tool_name"),
+                        tool_input=original.get("tool_input"),
+                    )
+                    tracker.transition_run(thread_id, "waiting_approval")
                     emit(emitter.custom("guardrail:approval_required", {
                         "approvalId": approval_id,
-                        "guardrailId": v["guardrail_id"],
+                        "guardrailId": v.get("guardrail_id"),
                         "toolCallId": call_id,
-                        "message": v["message"],
+                        "message": v.get("message", "Approval required"),
                         "severity": v.get("severity", "warning"),
+                        "createdAt": action["createdAt"],
+                        "expiresAt": action["expiresAt"],
+                        "tool": action.get("tool"),
                     }))
 
-                    if run:
-                        approval_event = asyncio.Event()
-                        run.guardrail_approvals[approval_id] = approval_event
-                        try:
-                            await asyncio.wait_for(approval_event.wait(), timeout=300)
-                        except asyncio.TimeoutError:
-                            run.guardrail_decisions[approval_id] = {"approved": False, "feedback": "Timed out"}
-                        decision = run.guardrail_decisions.get(approval_id, {"approved": False})
+                    timed_out = False
+                    try:
+                        await asyncio.wait_for(approval_event.wait(), timeout=300)
+                    except asyncio.TimeoutError:
+                        timed_out = True
+                        run.guardrail_decisions[approval_id] = {
+                            "approved": False,
+                            "feedback": "Approval timed out.",
+                        }
+                    except asyncio.CancelledError:
+                        await resolve_guardrail_action(
+                            run,
+                            approval_id,
+                            state="cancelled",
+                            approved=False,
+                            feedback="Run cancelled while awaiting approval.",
+                        )
                         run.guardrail_approvals.pop(approval_id, None)
                         run.guardrail_decisions.pop(approval_id, None)
+                        raise
 
-                        if decision.get("approved"):
-                            emit(emitter.custom("guardrail:approved", {
-                                "approvalId": approval_id,
-                                "toolCallId": call_id,
-                            }))
-                        else:
-                            denied_ids.add(call_id)
-                            emit(emitter.custom("guardrail:denied", {
-                                "approvalId": approval_id,
-                                "toolCallId": call_id,
-                            }))
+                    decision = run.guardrail_decisions.get(
+                        approval_id, {"approved": False}
+                    )
+                    run.guardrail_approvals.pop(approval_id, None)
+                    run.guardrail_decisions.pop(approval_id, None)
+                    if run.status == "waiting_approval":
+                        tracker.transition_run(thread_id, "running")
+
+                    if decision.get("approved"):
+                        await resolve_guardrail_action(
+                            run,
+                            approval_id,
+                            state="approved",
+                            approved=True,
+                            feedback=decision.get("feedback"),
+                        )
+                        emit(emitter.custom("guardrail:approved", {
+                            "approvalId": approval_id,
+                            "toolCallId": call_id,
+                        }))
+                    else:
+                        denied_ids.add(call_id)
+                        denied_decisions[call_id] = decision
+                        resolution = "timed_out" if timed_out else "denied"
+                        await resolve_guardrail_action(
+                            run,
+                            approval_id,
+                            state=resolution,
+                            approved=False,
+                            feedback=decision.get("feedback"),
+                        )
+                        emit(emitter.custom("guardrail:denied", {
+                            "approvalId": approval_id,
+                            "toolCallId": call_id,
+                            "state": resolution,
+                            "feedback": decision.get("feedback"),
+                        }))
 
                 # All blocked IDs = auto_reply + denied user-approval
                 blocked_ids = auto_reply_ids | denied_ids
@@ -572,7 +714,14 @@ async def _run_agent_loop(
                     call_id = v["tool_call_id"]
                     if call_id not in denied_ids:
                         continue
-                    result_json = json.dumps({"guardrail": v["guardrail_id"], "denied": True, "message": "The user denied this action. Do not retry it."})
+                    feedback = denied_decisions.get(call_id, {}).get("feedback")
+                    denial_message = feedback or "The user denied this action. Do not retry it."
+                    result_json = json.dumps({
+                        "guardrail": v["guardrail_id"],
+                        "denied": True,
+                        "message": denial_message,
+                        "feedback": feedback,
+                    })
                     emit(emitter.tool_call_result(call_id, result_json, msg_id))
                     orig = _original_tool_calls.get(call_id, {})
                     await sessions.append_message(thread_id, {
@@ -616,7 +765,10 @@ async def _run_agent_loop(
                     for cid in blocked_ids
                 ]
                 blocked_errors: list[Exception | None] = [
-                    ValueError("The user denied this action. Do not retry it.")
+                    ValueError(
+                        denied_decisions.get(cid, {}).get("feedback")
+                        or "The user denied this action. Do not retry it."
+                    )
                     if cid in denied_ids else
                     ValueError(next((v["message"] for v in pre_verdicts if v["tool_call_id"] == cid), "Blocked by guardrail"))
                     for cid in blocked_ids
@@ -805,26 +957,46 @@ async def _run_agent_loop(
             "maxTurns": max_turns,
         }))
         await persist_capability_receipt("completed", reason="max_turns")
-        emit(emitter.run_finished())
-        tracker.finish_run(thread_id)
+        await _terminalize_run(
+            thread_id,
+            outcome="success",
+            emitter=emitter,
+        )
 
     except asyncio.CancelledError:
         logger.info("Agent loop cancelled for thread %s", thread_id)
         await persist_capability_receipt("cancelled")
-        emit(emitter.run_finished())
-        tracker.finish_run(thread_id)
+        await _terminalize_run(
+            thread_id,
+            outcome="cancelled",
+            emitter=emitter,
+        )
 
     except HookError as e:
         await persist_capability_receipt("failed", reason="hook_error")
-        emit(emitter.run_error(str(e)))
-        tracker.finish_run(thread_id, "error")
+        await _terminalize_run(
+            thread_id,
+            outcome="failure",
+            emitter=emitter,
+            error=str(e),
+        )
 
     except Exception as e:
         logger.exception("Agent loop error")
         await persist_capability_receipt("failed", reason="internal_error")
-        emit(emitter.run_error(f"Internal error: {e}"))
-        emit(emitter.run_finished())
-        tracker.finish_run(thread_id, "error")
+        await _terminalize_run(
+            thread_id,
+            outcome="failure",
+            emitter=emitter,
+            error=f"Internal error: {e}",
+        )
+
+    finally:
+        current_runtime_bundle.reset(bundle_token)
+        current_emitter.reset(emitter_token)
+        current_thread_id.reset(thread_token)
+        if runtime_manager is not None:
+            await runtime_manager.release_run(run_id)
 
 
 # ── Session → LLM Message Conversion ──────────────────────────────────────
@@ -1108,7 +1280,7 @@ async def _tail_events(thread_id: str, after_cursor: int = 0, keepalive_interval
             yield ": keepalive\n\n"
 
         # Exit once run is finished and all events are drained
-        if run.status != "running":
+        if not is_live(run.status):
             remaining = run.get_events_after(cursor)
             for c, event_str in remaining:
                 yield event_str
@@ -1160,8 +1332,6 @@ async def run_agent(
     request: Request,
 ) -> StreamingResponse:
     """AG-UI compatible agent endpoint. Starts background task and tails events."""
-    providers: ProviderRegistry = request.app.state.providers
-    hooks: HookRegistry = request.app.state.hooks
     tracker = get_run_tracker()
 
     thread_id = req.get_thread_id()
@@ -1179,7 +1349,7 @@ async def run_agent(
 
     # Check for existing active run
     existing = tracker.get_run(thread_id)
-    if existing and existing.status == "running":
+    if existing and is_live(existing.status):
         # Already running — emit snapshot then tail the existing run
         return StreamingResponse(
             _stream_with_snapshot(thread_id),
@@ -1200,11 +1370,40 @@ async def run_agent(
             yield emitter.run_finished()
         return StreamingResponse(_history_only(), media_type=_SSE_MEDIA_TYPE)
 
+    runtime_manager = getattr(request.app.state, "runtime_manager", None)
+    if runtime_manager is not None:
+        bundle = runtime_manager.active_bundle
+        if not bundle.availability:
+            raise HTTPException(
+                503,
+                bundle.diagnostics.message
+                or f"Runtime {bundle.identity.runtime!r} is unavailable",
+            )
+        run_context = runtime_manager.acquire_run(run_id)
+        providers = run_context.bundle
+        hooks = providers.hooks
+    else:
+        providers = request.app.state.providers
+        hooks = request.app.state.hooks
+
     # Launch agent loop as background task
     task = asyncio.create_task(
-        _run_agent_loop(thread_id, run_id, req.messages, user_query, providers, hooks)
+        _run_agent_loop(
+            thread_id,
+            run_id,
+            req.messages,
+            user_query,
+            providers,
+            hooks,
+            runtime_manager,
+        )
     )
     tracker.start_run(thread_id, run_id, task)
+    if runtime_manager is not None:
+        tracker.set_runtime_metadata(
+            thread_id,
+            runtime=run_context.bundle.identity.runtime,
+        )
 
     return StreamingResponse(
         _stream_with_snapshot(thread_id),
@@ -1230,11 +1429,17 @@ async def agent_status(thread_id: str) -> dict[str, Any]:
     else:
         task_status = "running"
     return {
-        "running": run.status == "running",
+        "running": is_live(run.status),
         "status": run.status,
+        "requires_user_action": any(
+            action.get("state") == "pending"
+            and action.get("id") in run.guardrail_approvals
+            for action in run.guardrail_requests.values()
+        ),
+        "pending_actions": public_pending_actions(run),
         "run_id": run.run_id,
         "cursor": run.cursor,
-        "healthy": run.status == "running" and task_status == "running",
+        "healthy": is_live(run.status) and task_status == "running",
         "task_status": task_status,
         "started_at": run.started_at,
         "last_event_at": run.last_event_at,
@@ -1243,6 +1448,10 @@ async def agent_status(thread_id: str) -> dict[str, Any]:
             run.active_tool.get("lastOutputAt") if run.active_tool else None
         ),
         "active_tool": run.active_tool,
+        "runtime": run.runtime,
+        "runtime_run_id": run.runtime_run_id,
+        "runtime_session_id": run.runtime_session_id,
+        "usage": run.usage,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1260,11 +1469,77 @@ async def agent_events(thread_id: str, after: int = 0) -> StreamingResponse:
 
 
 @agent_router.post("/agent/cancel/{thread_id}")
-async def agent_cancel(thread_id: str) -> dict[str, Any]:
+async def agent_cancel(thread_id: str, request: Request) -> dict[str, Any]:
     """Cancel an active agent run."""
-    if not get_run_tracker().cancel_run(thread_id):
+    tracker = get_run_tracker()
+    run = tracker.get_run(thread_id)
+    if run is None or not is_live(run.status):
         raise HTTPException(404, "No active run to cancel")
-    return {"ok": True, "cancelled": thread_id}
+    manager = getattr(request.app.state, "runtime_manager", None)
+    ctx = manager.get_run(run.run_id) if manager is not None else None
+    if not tracker.cancel_run(thread_id):
+        raise HTTPException(409, "Run could not transition to stopping")
+
+    runtime_status = "stopping"
+    if ctx is not None:
+        ctx.cancel_event.set()
+        async with manager.callback_scope(run.run_id):
+            store = getattr(request.app.state, "runtime_run_store", None)
+            if store is not None:
+                try:
+                    mapping = await store.get_run(run.run_id)
+                    if mapping is not None and mapping.get("status") in {
+                        "queued",
+                        "running",
+                        "waiting_approval",
+                    }:
+                        await store.update_run(
+                            run.run_id, status="stopping"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed persisting stopping state for %s", run.run_id
+                    )
+
+            control = ctx.bundle.runtime_control
+            if control is not None and run.runtime_run_id:
+                try:
+                    await control.cancel(run.runtime_run_id)
+                    status = await control.status(run.runtime_run_id)
+                    observed = str(status.get("status") or "unknown")
+                    runtime_status = (
+                        observed
+                        if observed
+                        in {"completed", "failed", "cancelled"}
+                        else "unknown"
+                    )
+                except Exception:
+                    runtime_status = "unknown"
+                    logger.exception(
+                        "External runtime cancellation failed for %s",
+                        run.runtime_run_id,
+                    )
+                if store is not None:
+                    try:
+                        mapping = await store.get_run(run.run_id)
+                        if (
+                            mapping is not None
+                            and mapping.get("status")
+                            not in {"completed", "failed", "cancelled"}
+                        ):
+                            await store.update_run(
+                                run.run_id, status=runtime_status
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Failed reconciling cancellation for %s",
+                            run.run_id,
+                        )
+    return {
+        "ok": True,
+        "cancelled": thread_id,
+        "runtime_status": runtime_status,
+    }
 
 
 class GuardrailDecisionRequest(BaseModel):
@@ -1278,16 +1553,68 @@ async def guardrail_decision(thread_id: str, approval_id: str, req: GuardrailDec
     """Receive user approval/denial for a guardrail prompt."""
     run = get_run_tracker().get_run(thread_id)
     if run is None:
-        raise HTTPException(404, "No active run")
+        session = await sessions.get_session(thread_id)
+        stored = next(
+            (
+                action
+                for action in (session or {}).get("pendingActions", [])
+                if isinstance(action, dict) and action.get("id") == approval_id
+            ),
+            None,
+        )
+        if stored and stored.get("state") in {"approved", "denied"}:
+            if bool(stored.get("decision")) == req.approved:
+                return {
+                    "ok": True,
+                    "approved": req.approved,
+                    "state": stored.get("state"),
+                    "idempotent": True,
+                }
+            raise HTTPException(409, "This approval was already resolved differently")
+        if stored:
+            raise HTTPException(410, "This approval is no longer available")
+        raise HTTPException(404, "No approval request with this ID")
+
+    action = run.guardrail_requests.get(approval_id)
+    if action and action.get("state") in {"approved", "denied"}:
+        if bool(action.get("decision")) == req.approved:
+            return {
+                "ok": True,
+                "approved": req.approved,
+                "state": action.get("state"),
+                "idempotent": True,
+            }
+        raise HTTPException(409, "This approval was already resolved differently")
+    if action and action.get("state") != "pending":
+        raise HTTPException(410, "This approval is no longer available")
+
     approval_event = run.guardrail_approvals.get(approval_id)
     if approval_event is None:
+        if action:
+            raise HTTPException(410, "This approval is no longer available")
         raise HTTPException(404, "No pending guardrail approval with this ID")
+    feedback = req.feedback.strip() if req.feedback else None
+    if feedback and len(feedback) > 4000:
+        raise HTTPException(422, "Feedback must be 4000 characters or fewer")
     run.guardrail_decisions[approval_id] = {
         "approved": req.approved,
-        "feedback": req.feedback,
+        "feedback": feedback,
     }
+    if action:
+        await resolve_guardrail_action(
+            run,
+            approval_id,
+            state="approved" if req.approved else "denied",
+            approved=req.approved,
+            feedback=feedback,
+        )
     approval_event.set()
-    return {"ok": True, "approved": req.approved}
+    return {
+        "ok": True,
+        "approved": req.approved,
+        "state": "approved" if req.approved else "denied",
+        "idempotent": False,
+    }
 
 
 class CallbackRequest(BaseModel):
@@ -1307,15 +1634,17 @@ async def agent_callback(thread_id: str, req: CallbackRequest) -> dict[str, Any]
     emitter = AgentEventEmitter(thread_id, run.run_id)
     msg_id = req.message_id or str(uuid.uuid4())
 
-    if req.text:
-        tracker.append_event(thread_id, emitter.text_message_start(msg_id))
-        tracker.append_event(thread_id, emitter.text_delta(req.text, msg_id))
-        tracker.append_event(thread_id, emitter.text_message_end(msg_id))
-        # Note: don't persist here — OpenClaw's own persist callback
-        # (POST /chat/sessions/{id}/message) already handles storage.
-
-    tracker.append_event(thread_id, emitter.run_finished())
-    tracker.finish_run(thread_id)
+    await _terminalize_run(
+        thread_id,
+        outcome="success",
+        emitter=emitter,
+        assistant_text=req.text,
+        message_id=msg_id,
+        persist_success=False,
+        # OpenClaw's own persist callback owns storage, but its response still
+        # needs to be projected into this run's SSE stream.
+        emit_success_text=True,
+    )
     return {"ok": True}
 
 
@@ -1386,6 +1715,24 @@ async def get_chat_session(session_id: str) -> dict[str, Any]:
     session = await sessions.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    # A persisted prompt is actionable only while the matching executor still
+    # owns its waiter.  After a server restart, show the request as unavailable
+    # instead of presenting controls that can never resume the original call.
+    run = get_run_tracker().get_run(session_id)
+    actions: list[dict[str, Any]] = []
+    for stored in session.get("pendingActions", []):
+        if not isinstance(stored, dict):
+            continue
+        action = dict(stored)
+        if action.get("state") == "pending" and (
+            run is None
+            or action.get("runId") != run.run_id
+            or action.get("id") not in run.guardrail_approvals
+        ):
+            action["state"] = "unavailable"
+            action["requiresUserAction"] = False
+        actions.append(action)
+    session["pendingActions"] = actions
     return session
 
 
@@ -1486,7 +1833,7 @@ async def delete_chat_session(session_id: str, request: Request) -> dict[str, An
     # Stop the owner task before removing files it may still be writing.
     tracker = get_run_tracker()
     run = tracker.get_run(session_id)
-    if run is not None and run.status == "running":
+    if run is not None and is_live(run.status):
         tracker.cancel_run(session_id)
         if run.task is not None:
             try:
