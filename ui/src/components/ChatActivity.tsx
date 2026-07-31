@@ -6,6 +6,7 @@ import {
   RightOutlined,
 } from '@ant-design/icons'
 import type { GuardrailState, TimelineItem, ToolCallState } from '../hooks/useAGUI'
+import GuardrailCard from './GuardrailCard'
 import ToolResultRenderer from './tool-renderers/ToolResultRenderer'
 import {
   hasToolError,
@@ -141,10 +142,11 @@ function chartEvidenceKey(call: ToolCallState) {
   return `${cell}|${JSON.stringify(figures, (key, value) => (transient.has(key) ? undefined : value))}`
 }
 
-export function TurnActivity({ group, sessionId, onFileClick }: {
+export function TurnActivity({ group, sessionId, onFileClick, onGuardrailDecision }: {
   group: TurnGroup
   sessionId?: string | null
   onFileClick?: (path: string) => void
+  onGuardrailDecision?: (approvalId: string, status: 'approved' | 'denied', feedback?: string) => void
 }) {
   // Evidence is rendered separately, so the two arrays are partitioned rather
   // than chronological. Restore the original call order before deciding whether
@@ -152,21 +154,25 @@ export function TurnActivity({ group, sessionId, onFileClick }: {
   const allCalls = [...group.calls, ...group.evidence].sort((left, right) => left.order - right.order)
   const activityCalls = collapseDuplicateReportUpdates(group.calls)
   const isRunning = allCalls.some(call => call.status === 'calling')
+  const pendingApproval = group.guardrails.some(guardrail => guardrail.status === 'pending')
+  const isActive = isRunning || pendingApproval
   const errors = allCalls.filter(hasError)
   const fixedErrors = recoveredErrorCount(allCalls)
   const remainingErrors = errors.length - fixedErrors
-  const verb = isRunning
+  const verb = pendingApproval
+    ? 'Action required'
+    : isRunning
     ? 'Working'
     : group.calls.length > 0 && group.calls.every(call => call.name === 'propose_plan' || call.name === 'update_plan')
     ? 'Planned'
     : 'Worked'
   // A finished run stays compact like a notebook cell. Running or failed work
   // opens automatically because its detail is immediately actionable.
-  const [expanded, setExpanded] = useState(() => isRunning || errors.length > 0)
+  const [expanded, setExpanded] = useState(() => isActive || errors.length > 0)
 
   useEffect(() => {
-    if (isRunning) setExpanded(true)
-  }, [isRunning])
+    if (isActive) setExpanded(true)
+  }, [isActive])
 
   const now = useLiveNow(isRunning)
   const duration = relativeDuration(allCalls, now)
@@ -180,7 +186,7 @@ export function TurnActivity({ group, sessionId, onFileClick }: {
   const label = `${verb} · ${meta}`
 
   return (
-    <section className={`chat-turn${isRunning ? ' is-running' : ''}${remainingErrors ? ' has-error' : ''}${turnStartedAt !== null ? ' has-timing' : ''}`} aria-label={label}>
+    <section className={`chat-turn${isActive ? ' is-running' : ''}${remainingErrors ? ' has-error' : ''}${turnStartedAt !== null ? ' has-timing' : ''}`} aria-label={label}>
       <button
         type="button"
         className="chat-turn__header"
@@ -189,7 +195,7 @@ export function TurnActivity({ group, sessionId, onFileClick }: {
         onClick={() => setExpanded(value => !value)}
       >
         <RightOutlined className="chat-turn__chevron" />
-        {isRunning ? <LoadingOutlined spin aria-hidden="true" /> : remainingErrors ? <ExclamationCircleOutlined aria-hidden="true" /> : <CheckCircleOutlined aria-hidden="true" />}
+        {pendingApproval ? <ExclamationCircleOutlined aria-hidden="true" /> : isRunning ? <LoadingOutlined spin aria-hidden="true" /> : remainingErrors ? <ExclamationCircleOutlined aria-hidden="true" /> : <CheckCircleOutlined aria-hidden="true" />}
         <span className="chat-turn__summary">{verb}</span>
         <span className="chat-turn__meta">{meta}</span>
         {remainingErrors > 0 && <span className="chat-turn__error-count">· {remainingErrors} error{remainingErrors === 1 ? '' : 's'}</span>}
@@ -202,7 +208,7 @@ export function TurnActivity({ group, sessionId, onFileClick }: {
             <div key={`steps-${index}`} id={`${group.id}-details-${index}`} className="chat-turn__details">
               {row.items.map(item => item.kind === 'activity'
                 ? <ActivityStep key={item.call.id} call={item.call} turnStartedAt={turnStartedAt} duplicateCount={item.duplicateCount} />
-                : <GuardrailStep key={item.guardrail.id} guardrail={item.guardrail} />
+                : <GuardrailCard key={item.guardrail.id} guardrail={item.guardrail} threadId={sessionId || ''} onDecision={onGuardrailDecision} />
               )}
             </div>
           )
@@ -301,19 +307,6 @@ function ActivityStep({ call, turnStartedAt, duplicateCount = 1 }: { call: ToolC
           <CappedCode value={detail} />
         </div>
       )}
-    </div>
-  )
-}
-
-function GuardrailStep({ guardrail }: { guardrail: GuardrailState }) {
-  const isProblem = guardrail.status === 'denied' || guardrail.status === 'pending'
-  return (
-    <div className={`chat-step${isProblem ? ' is-error' : ''}`}>
-      <div className="chat-step__summary" role="status">
-        <span className="chat-step__time">system</span>
-        <span className="chat-step__mark" aria-hidden="true">{isProblem ? '!' : '·'}</span>
-        <span className="chat-step__label">Guardrail {guardrail.status.replace(/_/g, ' ')}{guardrail.message ? ` — ${guardrail.message}` : ''}</span>
-      </div>
     </div>
   )
 }

@@ -20,7 +20,7 @@ const PLUGIN_ID = 'dataclaw'
  * Self-contained drift banner. Mount anywhere a tool change might happen
  * (Tools page, custom-tool editor, MCP servers tab) and it will:
  *
- *   - Skip rendering when the configured agent backend isn't openclaw —
+ *   - Skip rendering when the configured agent runtime isn't openclaw —
  *     drift is only relevant when openclaw owns the agent loop.
  *   - Poll `/api/openclaw/plugins/dataclaw/sync-status` every 5s while
  *     mounted so the banner appears within a heartbeat of the user
@@ -39,8 +39,10 @@ export function OpenClawToolDriftAlert({ style }: { style?: React.CSSProperties 
       .then(r => (r.ok ? r.json() : null))
       .then(cfg => {
         if (cancelled || !cfg) return
-        const llm = cfg.llm ?? {}
-        const resolved = (llm.backend as string | undefined) || 'openclaw'
+        const configuredRuntime = cfg.agent?.runtime as string | undefined
+        const legacyBackend = cfg.llm?.backend as string | undefined
+        const resolved = configuredRuntime
+          || (legacyBackend === 'openclaw' ? 'openclaw' : 'dataclaw')
         setBackend(resolved)
       })
       .catch(() => {
