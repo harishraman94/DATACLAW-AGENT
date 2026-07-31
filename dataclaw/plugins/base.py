@@ -54,7 +54,7 @@ class PluginPage:
 class PluginConfigField:
     """Describes a config field for the plugin's UI config section."""
     name: str
-    field_type: str  # "string" | "int" | "bool" | "select"
+    field_type: str  # "string" | "secret" | "int" | "bool" | "select"
     label: str
     description: str = ""
     default: Any = None

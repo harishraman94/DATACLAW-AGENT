@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from dataclaw.plugins.base import (
-    DataclawPlugin,
     PluginConfigField,
     PluginContext,
     PluginPage,
@@ -24,17 +25,72 @@ from dataclaw_kaggle.tools import (
 )
 from dataclaw_kaggle.router import router as kaggle_router
 from dataclaw_kaggle.router import set_plugin_cfg as set_router_cfg
+from dataclaw_kaggle.client import get_auth_config, prepare_client, reset_api
+
+_SESSION_AWARE_DOWNLOAD_TOOLS = frozenset({
+    "kaggle_download_competition",
+    "kaggle_download_dataset",
+})
+
+
+async def inject_kaggle_session_context(state: dict[str, Any]) -> dict[str, Any]:
+    """Attach trusted session context to Kaggle download tool calls.
+
+    Download tools use this hidden value to add newly registered datasets to
+    the calling session's governed dataset allowlist. Always replace any
+    model-supplied context value with the session from pipeline state.
+    """
+    session_id = str(state.get("session_id") or "")
+    if not session_id:
+        return state
+
+    changed = False
+    pending_calls = []
+    for tool_call in state.get("pending_tool_calls", []):
+        if tool_call.get("tool_name") not in _SESSION_AWARE_DOWNLOAD_TOOLS:
+            pending_calls.append(tool_call)
+            continue
+
+        tool_input = dict(tool_call.get("tool_input") or {})
+        tool_input.pop("session_id", None)
+        tool_input["dataclaw_session_id"] = session_id
+        pending_calls.append({**tool_call, "tool_input": tool_input})
+        changed = True
+
+    if not changed:
+        return state
+    return {**state, "pending_tool_calls": pending_calls}
 
 
 class KagglePlugin:
     name = "dataclaw-kaggle"
     depends_on: list[str] = ["dataclaw-data"]
 
-    def register(self, ctx: PluginContext) -> None:
-        # Pass plugin config to tools and router
-        plugin_cfg = ctx.config.plugins.get("kaggle", {})
+    @staticmethod
+    def _apply_config(config: Any) -> None:
+        """Refresh module-level plugin config and cached authentication."""
+        plugin_cfg = config.plugins.get("kaggle", {})
         set_plugin_cfg(plugin_cfg)
         set_router_cfg(plugin_cfg)
+        reset_api()
+
+        # Kaggle authenticates a package-global client while importing. If
+        # Dataclaw already has credentials, contain that import before the
+        # config update completes. Keep the SDK lazy for unconfigured installs;
+        # importing it adds substantial startup cost and the first tool call
+        # already performs the same guarded import in a worker thread.
+        auth = get_auth_config(plugin_cfg)
+        if auth["api_token"] or (auth["username"] and auth["key"]):
+            prepare_client()
+
+    def register(self, ctx: PluginContext) -> None:
+        # Pass plugin config to tools and router
+        self._apply_config(ctx.config)
+
+        # Downloads auto-register with dataclaw-data. Supply trusted request
+        # context so the resulting dataset is immediately available to the
+        # session that initiated the download.
+        ctx.hooks.register("preToolCallHook", inject_kaggle_session_context)
 
         # Register API router
         ctx.include_api_router(kaggle_router, prefix="/kaggle", tags=["kaggle"])
@@ -191,6 +247,10 @@ class KagglePlugin:
             ],
         )
 
+    def on_config_update(self, config: Any) -> None:
+        """Apply Config-page changes without requiring a server restart."""
+        self._apply_config(config)
+
     def ui_manifest(self) -> PluginUIManifest:
         return PluginUIManifest(
             id="kaggle",
@@ -200,17 +260,24 @@ class KagglePlugin:
             config_title="Kaggle Integration",
             config_fields=[
                 PluginConfigField(
+                    name="kaggle_api_token",
+                    field_type="secret",
+                    label="Kaggle API Token",
+                    description="Recommended: token from Kaggle's Generate New Token flow (or set KAGGLE_API_TOKEN)",
+                    default="",
+                ),
+                PluginConfigField(
                     name="kaggle_username",
                     field_type="string",
-                    label="Kaggle Username",
-                    description="Your Kaggle username (or set KAGGLE_USERNAME env var)",
+                    label="Legacy Kaggle Username",
+                    description="Username from legacy kaggle.json credentials (or set KAGGLE_USERNAME)",
                     default="",
                 ),
                 PluginConfigField(
                     name="kaggle_key",
-                    field_type="string",
-                    label="Kaggle API Key",
-                    description="Your Kaggle API key (or set KAGGLE_KEY env var)",
+                    field_type="secret",
+                    label="Legacy Kaggle API Key",
+                    description="Key from legacy kaggle.json credentials (or set KAGGLE_KEY). Existing KGAT tokens saved here remain supported.",
                     default="",
                 ),
                 PluginConfigField(

@@ -1,8 +1,17 @@
 """Tests for config resolution."""
 
 import json
+import threading
+from types import SimpleNamespace
+
 import pytest
 
+import dataclaw.api.routers.config as config_router
+from dataclaw.api.routers.config import (
+    _hot_reload_plugins,
+    _mask_secrets_recursive,
+    _strip_masked_secrets,
+)
 from dataclaw.config.paths import DATACLAW_HOME, config_path, sessions_dir, skills_dir
 from dataclaw.config.migrations import migrate_runtime_utility_config
 from dataclaw.config.resolver import (
@@ -127,3 +136,91 @@ def test_resolve_separate_runtime_and_utility(
         assert resolve_utility_backend() == "gemini"
     finally:
         invalidate_cache()
+
+
+def test_kaggle_secrets_are_masked():
+    config = {
+        "plugins": {
+            "kaggle": {
+                "kaggle_api_token": "KGAT_abcdefghijklmnopqrstuvwxyz",
+                "kaggle_key": "legacy-secret-value",
+                "kaggle_username": "visible-user",
+            },
+        },
+    }
+
+    _mask_secrets_recursive(config)
+
+    kaggle = config["plugins"]["kaggle"]
+    assert kaggle["kaggle_api_token"] != "KGAT_abcdefghijklmnopqrstuvwxyz"
+    assert kaggle["kaggle_key"] != "legacy-secret-value"
+    assert kaggle["kaggle_username"] == "visible-user"
+
+
+def test_masked_kaggle_secrets_are_not_written_back():
+    updates = {
+        "plugins": {
+            "kaggle": {
+                "kaggle_api_token": "KGAT_abc...wxyz",
+                "kaggle_key": "***",
+                "download_dir": "/tmp/kaggle",
+            },
+        },
+    }
+
+    _strip_masked_secrets(updates)
+
+    kaggle = updates["plugins"]["kaggle"]
+    assert "kaggle_api_token" not in kaggle
+    assert "kaggle_key" not in kaggle
+    assert kaggle["download_dir"] == "/tmp/kaggle"
+
+
+def test_hot_reload_plugins_notifies_supported_plugins():
+    observed = []
+
+    class ReloadablePlugin:
+        name = "reloadable"
+
+        def on_config_update(self, config):
+            observed.append(config)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(plugins_list=[ReloadablePlugin(), object()])
+        )
+    )
+    config = DataclawConfig(plugins={"kaggle": {"kaggle_api_token": "KGAT_new"}})
+
+    _hot_reload_plugins(request, config)
+
+    assert observed == [config]
+
+
+@pytest.mark.asyncio
+async def test_config_update_runs_plugin_reload_off_event_loop(
+    monkeypatch,
+):
+    main_thread = threading.get_ident()
+    callback_threads = []
+
+    def fake_reload_plugins(request, config):
+        callback_threads.append(threading.get_ident())
+
+    monkeypatch.setattr(config_router, "_hot_reload_plugins", fake_reload_plugins)
+    # No RuntimeManager on this request, so reload_runtime falls back to the
+    # legacy synchronous agent reload.
+    monkeypatch.setattr(config_router, "_hot_reload_agent", lambda request: None)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                plugins_list=[],
+                providers=SimpleNamespace(),
+            )
+        )
+    )
+
+    await config_router.update_config({}, request)
+
+    assert callback_threads
+    assert callback_threads[0] != main_thread

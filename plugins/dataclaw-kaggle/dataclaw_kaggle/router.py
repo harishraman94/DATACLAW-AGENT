@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from dataclaw_kaggle import registry
-from dataclaw_kaggle.client import run_kaggle, get_config, reset_api
+from dataclaw_kaggle.client import get_auth_config, run_kaggle
 
 router = APIRouter()
 
@@ -23,8 +22,7 @@ def set_plugin_cfg(cfg: dict[str, Any]) -> None:
 
 
 def _creds() -> dict[str, str]:
-    u, k = get_config(_plugin_cfg)
-    return {"username": u, "key": k}
+    return get_auth_config(_plugin_cfg)
 
 
 # ── Request models ──────────────────────────────────────────────────────────

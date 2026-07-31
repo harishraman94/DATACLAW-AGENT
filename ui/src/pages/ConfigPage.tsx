@@ -1709,6 +1709,8 @@ function DynamicField({ field, value, onChange, disabled = false }: { field: Con
           <Select value={value} onChange={onChange} disabled={disabled} style={{ width: '100%' }}
             options={(field.options || []).map(o => ({ value: o.value, label: o.label }))} />
         )
+      case 'secret':
+        return <Input.Password value={value || ''} onChange={e => onChange(e.target.value)} disabled={disabled} />
       case 'string':
       default:
         return /(?:api[_-]?key|token|secret|password)/i.test(field.name)

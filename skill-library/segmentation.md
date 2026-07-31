@@ -20,7 +20,7 @@ Follow this process:
 
 4. Propose a plan with `dataclaw_propose_plan` before execution, and wait for approval. Include the segmentation type and why, the feature space and its construction, the standardization/encoding/dimensionality choices, the candidate algorithms, how the number of segments will be selected reconciling statistical and operational criteria, the stability and validation protocol, the fairness constraint, the assignment/typing plan, and the refusal conditions — decided now, not during execution. Report progress with `dataclaw_update_plan` after every step status change.
 
-5. Build the feature space leakage-safely. Fetch `feature_engineering`. Standardize continuous features (robustly when skewed); encode and measure mixed types with a distance that respects type (Gower, k-prototypes, or FAMD), never one-hot categoricals into k-means; reduce dimensionality (PCA for continuous, MCA for categorical, FAMD for mixed) when distance concentration threatens. For value tiers or uplift, model inputs are fold-scoped — `feature_engineering` owns the leakage rules. Exclude protected attributes and audit their proxies before clustering.
+5. Build the feature space leakage-safely. Fetch `feature_engineering`. Audit direct identifiers and high-cardinality near-identifiers first: exclude names, email addresses, phone numbers, account/customer/patient ids, free-text identifiers, and join keys from the feature matrix and model-visible profiles; retain only a protected join key outside the matrix when assignments must be joined back. Standardize continuous features (robustly when skewed); encode and measure mixed types with a distance that respects type (Gower, k-prototypes, or FAMD), never one-hot categoricals into k-means; reduce dimensionality (PCA for continuous, MCA for categorical, FAMD for mixed) when distance concentration threatens. For value tiers or uplift, model inputs are fold-scoped — `feature_engineering` owns the leakage rules. Exclude protected attributes and audit their proxies before clustering.
 
 6. Fit candidates and select — never trust a single run. Match the algorithm to the data shape (routing below), run multiple seeds, and select on internal validity *and* a stability criterion, not inertia alone. For model-based methods (GMM, LCA/LPA) select by BIC and entropy; for k-means/PAM by silhouette plus stability; for density (HDBSCAN) by min-cluster-size and the noise share. Log each configuration as an MLflow run with comparable metrics and the seed set so `dataclaw_query_mlflow_runs` can reconstruct the comparison.
 
@@ -64,9 +64,16 @@ from sklearn.metrics import silhouette_score
 
 # `cluster(X)` is your chosen algorithm returning integer labels; keep it fixed across resamples.
 labels = cluster(X)
-print(silhouette_score(X, labels))                        # internal separation — reported, not maximized blindly
+valid = labels != -1                                     # HDBSCAN noise is coverage, not a cluster
+valid_labels = np.unique(labels[valid])
+noise_share = 1 - valid.mean()
+print({"noise_share": noise_share})
+if len(valid_labels) >= 2 and valid.sum() > len(valid_labels):
+    print(silhouette_score(X[valid], labels[valid]))       # report; do not maximize blindly
+else:
+    print("silhouette undefined: fewer than two non-noise clusters")
 
-jaccard = {c: [] for c in np.unique(labels)}              # bootstrap stability (ref: R fpc::clusterboot)
+jaccard = {c: [] for c in valid_labels}                   # bootstrap stability over non-noise clusters (ref: R fpc::clusterboot)
 for _ in range(100):
     Xb, orig = resample(X, np.arange(len(X)))             # resample rows, keep original indices
     lb = cluster(Xb)
