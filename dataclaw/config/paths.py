@@ -54,6 +54,11 @@ def tool_config_path() -> Path:
     return DATACLAW_HOME / "tool-config.json"
 
 
+def runtime_runs_dir() -> Path:
+    """Durable external-runtime correlation records."""
+    return DATACLAW_HOME / "runtime-runs"
+
+
 def guardrail_config_path() -> Path:
     """Path to the global guardrail enable/disable config."""
     return DATACLAW_HOME / "guardrail-config.json"
@@ -71,5 +76,5 @@ def skill_library_dir() -> Path:
 
 def ensure_dirs() -> None:
     """Create all required directories if they don't exist."""
-    for d in [DATACLAW_HOME, sessions_dir(), skills_dir(), workspaces_dir(), plugins_dir(), tools_dir()]:
+    for d in [DATACLAW_HOME, sessions_dir(), skills_dir(), workspaces_dir(), plugins_dir(), tools_dir(), runtime_runs_dir()]:
         d.mkdir(parents=True, exist_ok=True)

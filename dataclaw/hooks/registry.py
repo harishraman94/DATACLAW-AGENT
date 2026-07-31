@@ -40,6 +40,14 @@ class HookRegistry:
             )
         self._hooks[point].remove(hook)
 
+    def clone(self) -> "HookRegistry":
+        """Snapshot the ordered hook chains for an in-flight runtime bundle."""
+        cloned = HookRegistry()
+        cloned._hooks = {
+            point: list(hooks) for point, hooks in self._hooks.items()
+        }
+        return cloned
+
     async def run(self, point: str, state: AgentState) -> AgentState:
         """Run all hooks at the given point sequentially.
 

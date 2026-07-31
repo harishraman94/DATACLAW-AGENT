@@ -1,8 +1,11 @@
 """Tests for the OpenClaw bridge plugin."""
 
 import asyncio
+from types import SimpleNamespace
 import pytest
 
+from dataclaw.hooks.registry import HookRegistry
+from dataclaw.plugins.registry import ProviderRegistry
 from dataclaw.providers.llm.provider import (
     TextDeltaEvent,
     TurnCompleteEvent,
@@ -20,6 +23,7 @@ from dataclaw_openclaw.agent_provider import (
     OpenClawAgentProvider,
     _extract_last_user_text,
 )
+from dataclaw_openclaw import OpenClawPlugin
 
 
 # ── Bridge Tests ────────────────────────────────────────────────────────────
@@ -31,6 +35,47 @@ def clean_bridges():
     yield
     from dataclaw_openclaw.bridge import _bridges
     _bridges.clear()
+
+
+@pytest.mark.asyncio
+async def test_runtime_factory_reuses_shared_dataclaw_utility_bundle(
+    monkeypatch,
+):
+    registry = ProviderRegistry()
+
+    class _Context:
+        providers = registry
+        session_cleanup_registry = None
+
+        @staticmethod
+        def include_api_router(*args, **kwargs):
+            del args, kwargs
+
+    OpenClawPlugin().register(_Context())
+    factory = registry.get_runtime_factory("openclaw")
+    assert factory is not None
+
+    utility = object()
+    base = SimpleNamespace(
+        llm=utility,
+        compaction=object(),
+        tool_availability=object(),
+        sub_agent_registry=object(),
+        sub_agent_hooks=object(),
+        memory=object(),
+        system_prompt=object(),
+        skill=object(),
+    )
+    monkeypatch.setattr(
+        "dataclaw.config.resolver.resolve",
+        lambda dot_path, env_var, default=None: default,
+    )
+
+    bundle = await factory(
+        SimpleNamespace(base_bundle=base, hooks=HookRegistry())
+    )
+    assert bundle.utility_llm is utility
+    assert bundle.sub_agent_registry is base.sub_agent_registry
 
 
 @pytest.mark.asyncio

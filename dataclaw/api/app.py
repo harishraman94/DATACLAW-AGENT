@@ -123,6 +123,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg_path.write_text(json.dumps(DataclawConfig().model_dump(), indent=2))
         logger.info("Created default config at %s", cfg_path)
     else:
+        from dataclaw.config.migrations import migrate_runtime_utility_config
+
+        try:
+            raw = json.loads(cfg_path.read_text())
+            if migrate_runtime_utility_config(raw):
+                cfg_path.write_text(json.dumps(raw, indent=2))
+                logger.info(
+                    "Separated agent runtime and utility model config in %s",
+                    cfg_path,
+                )
+        except Exception:
+            logger.exception("Failed to migrate runtime/utility configuration")
         # File exists — backfill any new schema defaults the user is missing.
         _bootstrap_core_schema_defaults(cfg_path)
 
@@ -203,8 +215,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _bootstrap_plugin_defaults(plugins, cfg_path)
     invalidate_cache()  # Ensure resolver picks up newly written defaults
 
+    # Post-registration runtime selection. External plugins have registered
+    # factories by this point, and their config defaults are now visible.
+    from dataclaw.providers.agent.factory import (
+        RuntimeManager,
+        build_direct_bundle,
+    )
+    from dataclaw.storage.runtime_runs import RuntimeRunStore
+
+    # Runtime plugins may capture this store in their factories. Create it
+    # before selection so the adapter, callback routes, and restart recovery
+    # all share one instance.
+    runtime_run_store = getattr(
+        app.state, "runtime_run_store", RuntimeRunStore()
+    )
+    app.state.runtime_run_store = runtime_run_store
+    await runtime_run_store.fail_nonterminal_runs()
+    provisional_bundle = build_direct_bundle(registry, hooks, "mock")
+    runtime_manager = RuntimeManager(registry, hooks, provisional_bundle)
+    registry.runtime_manager = runtime_manager
+    await runtime_manager.select(startup=True)
+
     app.state.providers = registry
-    app.state.hooks = hooks
+    app.state.hooks = runtime_manager.active_bundle.hooks
+    app.state.runtime_manager = runtime_manager
     app.state.config = config
     app.state.plugins_list = plugins
     app.state.guardrail_registry = guardrail_registry
@@ -231,6 +265,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Run shutdown handlers
         for handler in app.router.on_shutdown:
             await handler()
+        await runtime_manager.aclose()
 
 
 def create_app() -> FastAPI:

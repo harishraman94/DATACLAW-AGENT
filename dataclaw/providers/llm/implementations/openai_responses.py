@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextvars import ContextVar
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
@@ -44,8 +45,21 @@ class OpenAIResponsesLLM:
             base_url=base_url,
             default_headers=default_headers or {},
         )
-        self._last_tool_calls: list[dict[str, Any]] = []
-        self.prompt_cache_key: str | None = None
+        # A provider instance is shared by concurrent runs.  The cache key is
+        # request state, so keep it task-local instead of allowing one thread
+        # to overwrite another thread's value between request construction and
+        # dispatch.
+        self._prompt_cache_key: ContextVar[str | None] = ContextVar(
+            f"openai_prompt_cache_key_{id(self)}", default=None
+        )
+
+    @property
+    def prompt_cache_key(self) -> str | None:
+        return self._prompt_cache_key.get()
+
+    @prompt_cache_key.setter
+    def prompt_cache_key(self, value: str | None) -> None:
+        self._prompt_cache_key.set(value)
 
     async def stream_turn(
         self,
@@ -104,7 +118,7 @@ class OpenAIResponsesLLM:
         if text_verbosity:
             kwargs["text"] = {"verbosity": text_verbosity}
 
-        self._last_tool_calls = []
+        completed_tool_calls: list[dict[str, Any]] = []
         pending_calls: dict[str, dict[str, Any]] = {}
         seen_call_ids: set[str] = set()
         reasoning_chunks: list[str] = []
@@ -156,7 +170,7 @@ class OpenAIResponsesLLM:
                         seen_call_ids.add(call_id)
                     yield ToolUseStartEvent(tool_name=name, call_id=call_id)
 
-                    self._last_tool_calls.append({
+                    completed_tool_calls.append({
                         "id": call_id,
                         "name": name,
                         "args": args,
@@ -175,14 +189,14 @@ class OpenAIResponsesLLM:
             )
 
         # Yield pending tool calls
-        for tc in self._last_tool_calls:
+        for tc in completed_tool_calls:
             yield PendingToolCall(
                 call_id=tc["id"],
                 tool_name=tc["name"],
                 tool_input=tc["args"],
             )
 
-        yield TurnCompleteEvent(has_pending_tool_calls=bool(self._last_tool_calls))
+        yield TurnCompleteEvent(has_pending_tool_calls=bool(completed_tool_calls))
 
     def build_tool_result_message(
         self,

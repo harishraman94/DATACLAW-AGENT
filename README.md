@@ -13,6 +13,42 @@ https://github.com/user-attachments/assets/25dc8181-bd14-41ad-a81c-5f9fe108e30a
 
 ---
 
+## Release 4 — Hermes runtime and runtime-safe orchestration
+
+Release 4 adds Hermes Agent as a first-class runtime alongside Dataclaw and OpenClaw. Dataclaw remains the product and governance surface — it owns conversation history, enabled tools, hooks, guardrails, approvals, persistence, and run visibility — while Hermes can own the selected agent loop without depending on OpenClaw.
+
+### Capabilities
+
+| Area | Capability |
+|---|---|
+| Runtime selection | Separates the primary agent runtime (`agent.runtime`) from Dataclaw's shared utility model (`llm.backend`). Dataclaw, Hermes, and OpenClaw can now use the same utility provider for compaction and delegated sub-agents while Hermes and OpenClaw keep their own primary models. Legacy combined runtime/provider settings are migrated automatically. |
+| Runtime isolation | Centralizes provider selection in immutable runtime bundles. Each run keeps the agent, utility model, compaction, tools, sub-agent registry, memory, skills, and hooks it started with, so a configuration reload cannot mix old and new providers mid-turn. A failed reload keeps the last working bundle active and exposes the configured-versus-active mismatch. |
+| Hermes integration | Adds an independently installable Dataclaw adapter and Hermes extension targeting `hermes-agent==0.19.0`. A restricted Hermes profile exposes only Dataclaw tool dispatch and tool search; the integration does not import, invoke, or require OpenClaw. |
+| Governed tools | Hermes tool calls are rechecked against session and project scope, then pass through Dataclaw's existing hooks, guardrails, user approval, event emission, and message persistence. Stable run and tool-call correlation, serialized callbacks, and idempotent retries prevent a callback from attaching to the wrong run or executing the same call twice. |
+| Runs and recovery | Adds durable external-runtime correlation and structured `queued`, `running`, `waiting_approval`, `stopping`, `completed`, `failed`, and `cancelled` handling. One chat-router terminalization path ensures that successful assistant output is persisted once and duplicate terminal signals are ignored. |
+| Approvals | Approval requests are recorded as pending session actions and restored in the chat UI after a page refresh or stream reconnect. The composer pauses while a decision is required, while Stop remains available; approval feedback is returned to the agent when a request is denied. |
+| Configuration and operations | Reworks the Agent configuration surface around separate **Utility model** and **Agent runtime** choices, with configured/active runtime status, Hermes install and extension setup, API health, model configuration, restart controls, and actionable authentication errors. |
+| Evaluation | Adds a non-gating Hermes native batch-evaluation command with machine-readable summaries for model and tool baselines. Governed tool, approval, and Runs behavior remains covered by the adapter integration tests. |
+
+### Hermes setup
+
+Hermes runs in its own compatible environment. Install the pinned API-server build, then use the Config page to create the restricted `dataclaw` profile, install the bundled extension, authenticate the Hermes primary model, and select **Hermes Agent** as the runtime:
+
+```bash
+uv tool install --python 3.12 'hermes-agent[messaging]==0.19.0'
+```
+
+Configure a Dataclaw utility provider separately. Hermes 0.19's chat endpoint runs a complete server-side agent and does not provide the raw continuation contract needed by Dataclaw compaction and delegated sub-agents.
+
+See the [Hermes runtime plan](docs/hermes-runtime-plan.md), [implementation contract](docs/hermes-runtime-implementation-spec.md), and [adapter guide](plugins/dataclaw-hermes/README.md) for architecture, configuration, diagnostics, and evaluation details.
+
+### Release scope
+
+- Hermes mode is implemented against the pinned `hermes-agent==0.19.0` source contract. Live compatibility capture for streaming, approvals, cancellation, reconnects, correlation, and batch execution remains a release gate before treating the integration as production-ready.
+- Approval waits and live event streams are process-local. They can survive a browser refresh, but not a Dataclaw or Hermes process restart; cross-restart approval recovery and event replay are deferred.
+- Release 4 reuses Dataclaw's existing `delegate_to_subagent` tool. Hermes-native delegation, persistent goals, long-term memory, scheduled/background work, multiple profiles, and per-session runtime pinning are not included.
+- The integration preserves Dataclaw's local/private trust model and adds no authentication, TLS, sandbox, or multi-user boundary. Hermes callback routes are unauthenticated, so keep Dataclaw and Hermes on loopback or a trusted private network.
+
 ## Release 3 — governed analysis and reporting
 
 Release 3 adds an evidence-backed path from exploratory analysis to a reviewed, versioned report, together with a redesigned session workspace, a reworked reporting layer, a rebuilt configuration surface, and live run feedback. The governance model runs throughout: claims trace back to evidence, and publication is gated on the required reviews.
@@ -438,7 +474,9 @@ All runtime data under `~/.dataclaw/` (override with `$DATACLAW_HOME`):
 
 | Variable | Config path | Default |
 |---|---|---|
-| `DATACLAW_LLM_BACKEND` | `llm.backend` | `openclaw` |
+| `DATACLAW_AGENT_RUNTIME` | `agent.runtime` | `openclaw` |
+| `DATACLAW_UTILITY_BACKEND` | `llm.backend` | `codex` |
+| `DATACLAW_LLM_BACKEND` | Legacy combined runtime/provider override | |
 | `ANTHROPIC_API_KEY` | `llm.anthropic.api_key` | |
 | `OPENAI_API_KEY` | `llm.openai.api_key` / `llm.codex.api_key` | |
 | `GOOGLE_API_KEY` | `llm.gemini.api_key` | |
@@ -450,7 +488,10 @@ All runtime data under `~/.dataclaw/` (override with `$DATACLAW_HOME`):
 | `DATACLAW_TOKEN` | `plugins.openclaw.token` | `dataclaw-local` |
 | `DATACLAW_OPENCLAW_URL` | `plugins.openclaw.url` | `http://127.0.0.1:18789` |
 
-Config changes to the agent backend are **hot-reloaded** — no server restart needed.
+Changes to the agent runtime or DataClaw utility model are **hot-reloaded** — no
+server restart needed. The utility model is shared by DataClaw, Hermes, and
+OpenClaw for compaction and delegated sub-agents. When `agent.runtime` is
+`dataclaw`, the same model also runs the primary agent.
 
 ---
 

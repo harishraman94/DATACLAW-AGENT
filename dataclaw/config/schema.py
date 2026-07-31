@@ -30,11 +30,17 @@ class CodexConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    backend: str = "openclaw"  # openclaw | anthropic | openai | gemini | codex
+    # DataClaw-owned utility model. The selected agent runtime is configured
+    # separately under agent.runtime.
+    backend: str = "codex"  # anthropic | openai | gemini | codex
     anthropic: AnthropicConfig = AnthropicConfig()
     openai: OpenAIConfig = OpenAIConfig()
     gemini: GeminiConfig = GeminiConfig()
     codex: CodexConfig = CodexConfig()
+
+
+class AgentConfig(BaseModel):
+    runtime: str = "openclaw"  # dataclaw | hermes | openclaw | mock
 
 
 class CompactionConfig(BaseModel):
@@ -83,6 +89,7 @@ class MemoryConfig(BaseModel):
 
 
 class DataclawConfig(BaseModel):
+    agent: AgentConfig = AgentConfig()
     llm: LLMConfig = LLMConfig()
     compaction: CompactionConfig = CompactionConfig()
     memory: MemoryConfig = MemoryConfig()

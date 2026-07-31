@@ -211,14 +211,13 @@ async def login_finish_redirect(request: Request) -> dict[str, Any]:
 async def _hot_reload_agent_after_login(request: Request) -> None:
     """Re-run the agent provider hot-reload after a successful Codex login.
 
-    Safe to call on every login completion — when ``llm.backend`` isn't
-    codex the reload is effectively a no-op (the existing provider for the
-    selected backend is rebuilt with the same config).
+    Safe to call on every login completion. The selected agent runtime is
+    rebuilt with the newly authenticated DataClaw utility model.
     """
     try:
-        from dataclaw.api.routers.config import _hot_reload_agent
+        from dataclaw.api.routers.config import reload_runtime
 
-        await asyncio.to_thread(_hot_reload_agent, request)
+        await reload_runtime(request)
     except Exception:  # never block login completion on a hot-reload failure
         logger.exception("Failed to hot-reload agent after Codex login")
 

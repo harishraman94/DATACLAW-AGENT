@@ -9,7 +9,10 @@ from typing import Any
 from fastapi import APIRouter, Request
 
 from dataclaw.config.paths import config_path
-from dataclaw.config.resolver import invalidate_cache, resolve
+from dataclaw.config.resolver import (
+    invalidate_cache,
+    resolve_agent_runtime,
+)
 from dataclaw.config.schema import DataclawConfig
 
 logger = logging.getLogger(__name__)
@@ -31,6 +34,9 @@ async def get_config(request: Request) -> dict[str, Any]:
 
     # Include current active agent backend
     raw["_active_agent"] = _detect_active_agent(request)
+    manager = getattr(request.app.state, "runtime_manager", None)
+    if manager is not None:
+        raw["_runtime_status"] = manager.diagnostics
 
     return raw
 
@@ -58,52 +64,39 @@ async def update_config(updates: dict[str, Any], request: Request) -> dict[str, 
     except Exception:
         logger.exception("Failed to refresh app.state.config after PATCH")
 
-    # Hot-reload providers from updated config. Some factories (notably
-    # gbrain memory in `location=new` mode) shell out to subprocesses
-    # during construction, which would block the event loop if run
-    # inline — push them to a worker thread.
-    import asyncio
-    await asyncio.to_thread(_hot_reload_agent, request)
-    await asyncio.to_thread(_hot_reload_memory, request)
-    await asyncio.to_thread(_hot_reload_compaction, request)
+    await reload_runtime(request)
 
     return {"status": "updated"}
 
 
+async def reload_runtime(request: Request) -> Any:
+    """Route every runtime reload through the centralized async selector."""
+    invalidate_cache()
+    manager = getattr(request.app.state, "runtime_manager", None)
+    if manager is None:
+        # Compatibility for lightweight tests and embedding code that has not
+        # run the application lifespan.
+        _hot_reload_agent(request)
+        return None
+    bundle = await manager.select()
+    request.app.state.hooks = bundle.hooks
+    return bundle
+
+
 def _hot_reload_agent(request: Request) -> None:
-    """Rebuild the agent (and LLM) provider from current config."""
+    """Legacy synchronous reload for callers without a RuntimeManager."""
     try:
         providers = request.app.state.providers
         invalidate_cache()
-
-        # ``llm.backend`` is the canonical signal — picking codex/anthropic/etc.
-        # in the UI must take precedence over a stale ``plugins.openclaw.url``.
-        # An earlier version routed on ``if openclaw_url:`` regardless of
-        # backend, which silently kept the OpenClaw agent active whenever the
-        # openclaw plugin's url default was still in the config (i.e., always —
-        # ``_bootstrap_plugin_defaults`` writes it on first run). Symptom: user
-        # picks codex, saves, sends a chat → "OpenClaw not running" error,
-        # because providers.agent is still OpenClawAgentProvider.
-        backend = resolve("llm.backend", "DATACLAW_LLM_BACKEND", "openclaw")
-
-        if backend == "openclaw":
-            openclaw_url = (
-                resolve("plugins.openclaw.url", "DATACLAW_OPENCLAW_URL", "")
-                or "http://127.0.0.1:18789"
+        backend = resolve_agent_runtime()
+        if backend in {"openclaw", "hermes"}:
+            logger.warning(
+                "Cannot synchronously select external runtime %s without "
+                "the application RuntimeManager",
+                backend,
             )
-            try:
-                from dataclaw_openclaw.agent_provider import OpenClawAgentProvider
-                token = resolve("plugins.openclaw.token", "DATACLAW_TOKEN",
-                        resolve("plugins.openclaw.frontend_token", "DATACLAW_FRONTEND_TOKEN", ""))
-                wait_ms = int(resolve("plugins.openclaw.wait_ms", "DATACLAW_OPENCLAW_WAIT_MS", "300000"))
-                providers.agent = OpenClawAgentProvider(url=openclaw_url, token=token, wait_ms=wait_ms)
-                logger.info("Hot-reloaded agent: OpenClaw (%s)", openclaw_url)
-            except ImportError:
-                logger.warning("dataclaw-openclaw plugin not installed, falling back to LLM")
-                _reload_llm_agent(providers, backend)
-        else:
-            _reload_llm_agent(providers, backend)
-
+            return
+        _reload_llm_agent(providers, backend)
     except Exception:
         logger.exception("Failed to hot-reload agent provider")
 
@@ -148,9 +141,10 @@ def _hot_reload_compaction(request: Request) -> None:
 def _detect_active_agent(request: Request) -> str:
     """Return the name of the currently active agent provider."""
     try:
-        backend = resolve("llm.backend", "DATACLAW_LLM_BACKEND", "openclaw")
-        if backend == "openclaw":
-            return "openclaw"
+        manager = getattr(request.app.state, "runtime_manager", None)
+        if manager is not None:
+            return manager.active_runtime
+        backend = resolve_agent_runtime()
         agent = request.app.state.providers.agent
         name = type(agent).__name__
         if "OpenClaw" in name:

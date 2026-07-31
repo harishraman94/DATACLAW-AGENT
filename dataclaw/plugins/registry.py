@@ -26,6 +26,8 @@ class ProviderRegistry:
         self.agent: Any = None
         self.sub_agent_registry: SubAgentRegistry = SubAgentRegistry()
         self.sub_agent_hooks: SubAgentHookRegistry = SubAgentHookRegistry()
+        self._runtime_factories: dict[str, Any] = {}
+        self.runtime_manager: Any = None
 
     def replace(self, slot: str, provider: Any) -> None:
         """Replace the provider in the given slot."""
@@ -44,3 +46,35 @@ class ProviderRegistry:
             if getattr(self, slot) is None:
                 errors.append(f"Provider slot {slot!r} is not populated")
         return errors
+
+    def register_runtime_factory(self, runtime: str, factory: Any) -> None:
+        """Register an external runtime constructor without selecting it."""
+        name = runtime.strip().lower()
+        if not name:
+            raise ValueError("runtime name is required")
+        if name in self._runtime_factories:
+            raise ValueError(f"Runtime factory already registered: {name}")
+        self._runtime_factories[name] = factory
+
+    def get_runtime_factory(self, runtime: str) -> Any | None:
+        return self._runtime_factories.get(runtime.strip().lower())
+
+    def list_runtime_factories(self) -> tuple[str, ...]:
+        return tuple(sorted(self._runtime_factories))
+
+    def publish_bundle(self, bundle: Any) -> None:
+        """Publish a bundle through legacy provider slots atomically enough for
+        synchronous readers.
+
+        New run code captures ``RuntimeManager.active_bundle``. These aliases
+        remain for existing routes and plugins that inspect the registry.
+        """
+        self.agent = bundle.agent
+        self.llm = bundle.utility_llm
+        self.compaction = bundle.compaction
+        self.tool_availability = bundle.tool_availability
+        self.sub_agent_registry = bundle.sub_agent_registry
+        self.sub_agent_hooks = bundle.sub_agent_hooks
+        self.memory = bundle.memory
+        self.system_prompt = bundle.system_prompt
+        self.skill = bundle.skill

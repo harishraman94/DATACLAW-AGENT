@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from dataclaw.config.resolver import resolve
+from dataclaw.config.resolver import resolve, resolve_utility_backend
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,7 @@ def llm_from_config(
     If backend is "mock" or no API key is configured for the selected
     backend, returns a MockLLM for development/testing.
     """
-    backend = backend or resolve("llm.backend", "DATACLAW_LLM_BACKEND", "openclaw")
+    backend = backend or resolve_utility_backend()
 
     if backend == "mock":
         from dataclaw.providers.llm.implementations.mock_llm import MockLLM
@@ -85,12 +85,6 @@ def llm_from_config(
             model=model_id,
             default_headers=creds.headers,
         )
-
-    elif backend == "openclaw":
-        # OpenClaw handles its own LLM — provide a mock for compaction/sub-agents
-        from dataclaw.providers.llm.implementations.mock_llm import MockLLM
-        logger.info("LLM backend is 'openclaw' — using mock LLM for internal providers")
-        return MockLLM()
 
     else:
         raise ValueError(f"Unknown LLM backend: {backend!r}")
