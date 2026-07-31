@@ -244,6 +244,38 @@ async def test_screened_validated_finding_requires_correction_or_holdout():
 
 
 @pytest.mark.asyncio
+async def test_screened_readiness_finding_does_not_require_multiple_testing_correction():
+    proposed = await propose_eda_hypotheses(
+        hypotheses=[{
+            "statement": "Feature scales require robust controls",
+            "rationale": "Twenty-one columns were inspected for data preparation",
+            "source": "data_signal",
+            "selection": {
+                "screened_n": 21,
+                "selection_rule": "Reviewed schema and descriptive summaries",
+                "correction": "none",
+            },
+        }],
+        dataset_id="ds",
+    )
+
+    result = await record_eda_finding(
+        title="Feature controls are ready",
+        finding_type="readiness",
+        summary="Rates, winsorization, and robust scaling were applied.",
+        evidence={"kind": "notebook_cell", "cell_id": "c-ready", "source_sha256": "hash-ready"},
+        dataset_id="ds",
+        hypothesis_id=proposed["hypothesis_ids"][0],
+        hypothesis_status="confirmed",
+        disposition="confirmed",
+        confidence="high",
+        validation=_validated_internal("c-ready"),
+    )
+
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
 async def test_hypothesis_selection_floor_applies_to_atomic_confirmation():
     proposed = await propose_eda_hypotheses(
         hypotheses=[
@@ -504,6 +536,35 @@ async def test_plan_step_readiness_ignores_unattributed_findings():
         dataset_id="ds",
         purpose="query",
         plan_step_id="step-12345678",
+    )
+
+    assert ready["status"] == "ready"
+    assert ready["missing_checks"] == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_readiness_aggregates_evidence_across_plan_steps():
+    for step_id, finding_type, check in [
+        ("step-quality", "data_quality", "data_quality"),
+        ("step-missing", "missingness", "missingness"),
+    ]:
+        await record_eda_finding(
+            title=f"{check} checked",
+            finding_type=finding_type,
+            summary=f"{check} complete",
+            evidence={"kind": "notebook_cell", "cell_id": step_id, "source_sha256": f"hash-{step_id}"},
+            dataset_id="ds",
+            validation=_validated_internal(step_id),
+            covers_checks=[check],
+            proposal_id="plan-1",
+            plan_step_id=step_id,
+        )
+
+    ready = await summarize_eda_readiness(
+        dataset_id="ds",
+        purpose="query",
+        proposal_id="plan-1",
+        plan_step_id="step-delivery",
     )
 
     assert ready["status"] == "ready"

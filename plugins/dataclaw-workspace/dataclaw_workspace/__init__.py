@@ -26,6 +26,7 @@ from dataclaw_workspace.tools import (
     report_design_report,
     report_review_visuals,
     report_publish,
+    set_current_workspace_id,
     set_project_dir,
 )
 from dataclaw_workspace.config import WorkspaceConfig, load_config
@@ -41,6 +42,8 @@ class WorkspacePlugin:
         # Hook: set workspace base to project directory when a project is active
         async def _inject_project_dir(state):
             project_id = state.get("project_id", "")
+            session_id = state.get("session_id", "")
+            set_current_workspace_id(session_id or "default")
             logger.info("workspace preToolCallHook: project_id=%r", project_id)
             if project_id:
                 try:
@@ -58,7 +61,6 @@ class WorkspacePlugin:
             else:
                 # An independent chat owns a session workspace; it is not a
                 # synthetic project and must never share the default workspace.
-                session_id = state.get("session_id", "")
                 set_project_dir(workspaces_dir() / session_id if session_id else None)
             return state
 
@@ -171,7 +173,7 @@ class WorkspacePlugin:
                     "insights": {"type": "array", "description": "Completed findings/insights with title, summary/detail, evidence, caveat, metrics, ids", "items": {"type": "object"}},
                     "analyses": {"type": "array", "description": "Analysis assets such as Plotly figures, aggregate records, chart specs, tables, cards, metrics, findings, hypotheses, process steps, methods, or evidence. The author may choose the best report treatment. Set required_visual=true only when this exact asset must appear as a reader-facing figure; then supply its existing Plotly figure, a familiar chart mapping (bar/line/scatter/heatmap), or a supported aggregate visual mapping. semantic_role can declare kpi/scorecard, conclusions, hypotheses, process/mechanism, comparison/tradeoffs, lookup/catalog, methodology, data_quality, uncertainty, provenance, timeline, or status. For editorial control, an asset may declare editorial_role='hero', story_priority (lower is earlier), and diagnostic_group/comparison_group for a deliberate paired comparison.", "items": {"type": "object"}, "default": []},
                     "audience": {"type": "string", "description": "Target reader/audience", "default": ""},
-                    "requirements": {"type": "object", "description": "Optional report requirements: metrics, filters, methodology, hypotheses, checks, titles, evidence_registry, analysis_review, editorial_archetype, and story_arcs. Explicit story_arcs control the narrative; otherwise the handcrafted compiler groups existing analyses around the supplied report goal without inventing findings. Use editorial_archetype='taxonomy_explorer' for category cards → evidence → explorer, or 'guided_explorer' for the same paced evidence/explorer flow without taxonomy cards. For forecasts, analysis_review can declare mode, baseline, uncertainty, sensitivity, decision_path, outcome_distribution, assumptions, and export_runtime; critique returns durable findings for anything missing.", "default": {}},
+                    "requirements": {"type": "object", "description": "Optional report requirements: metrics, filters, methodology, hypotheses, checks, titles, evidence_registry, analysis_review, editorial_archetype, and story_arcs. Explicit story_arcs control the narrative; otherwise the handcrafted compiler groups existing analyses around the supplied report goal without inventing findings. Use editorial_archetype='taxonomy_explorer' for category cards → evidence → explorer, or 'guided_explorer' for the same paced evidence/explorer flow without taxonomy cards. analysis_review findings are advisory by default; set analysis_review.enforcement='strict' only when missing required analytical work must block authoring and publication. Forecast contracts may also declare mode, baseline, uncertainty, sensitivity, decision_path, outcome_distribution, assumptions, and export_runtime.", "default": {}},
                     "report_path": {"type": "string", "description": "Output report HTML path", "default": "report.html"},
                     "storyboard_path": {"type": "string", "description": "Output storyboard JSON path", "default": "report_storyboard.json"},
                     "title": {"type": "string", "description": "Report title", "default": "Analysis Report"},

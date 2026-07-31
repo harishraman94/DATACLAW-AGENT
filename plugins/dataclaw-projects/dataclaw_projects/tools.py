@@ -227,13 +227,15 @@ def _build_emit_callback():
 def _resolve_project_dir() -> str | None:
     """Resolve the active project's working directory.
 
-    The workspace plugin sets _project_dir per-request via a preToolCallHook
+    The workspace plugin sets the project directory via a preToolCallHook
     when a project is active. We read it here to inject into subagent config.
     """
     try:
-        from dataclaw_workspace.tools import _project_dir
-        if _project_dir is not None:
-            return str(_project_dir)
+        from dataclaw_workspace.tools import get_project_dir
+
+        project_dir = get_project_dir()
+        if project_dir is not None:
+            return str(project_dir)
     except ImportError:
         pass
     return None

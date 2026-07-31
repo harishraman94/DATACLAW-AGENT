@@ -62,17 +62,19 @@ def evaluate_readiness(
     mode: str = "",
     required_checks: list[str] | None = None,
     plan_step_id: str = "",
+    proposal_id: str = "",
 ) -> dict[str, Any]:
     findings = [
         finding
         for finding in active_findings(session_id)
         if str(finding.get("dataset_id") or "") == str(dataset_id)
         and (
-            not plan_step_id
-            or (
+            (proposal_id and str(finding.get("proposal_id") or "") == str(proposal_id))
+            or (not proposal_id and not plan_step_id)
+            or (not proposal_id and (
                 str(finding.get("plan_step_id") or "") == str(plan_step_id)
                 and finding.get("attribution_status") != "unattributed_step"
-            )
+            ))
         )
     ]
     hypotheses = [

@@ -123,6 +123,15 @@ def test_present_notebook_cell_ids_reads_workspace_notebooks(cfg):
     assert sorted(cited & present) == ["aaaa1111", "bbbb2222"]
 
 
+def test_effective_workspace_id_uses_request_context_for_review_storage():
+    workspace_tools.set_current_workspace_id("session-123")
+    try:
+        assert workspace_tools._effective_workspace_id() == "session-123"
+        assert workspace_tools._effective_workspace_id("explicit-session") == "explicit-session"
+    finally:
+        workspace_tools.set_current_workspace_id("default")
+
+
 @pytest.mark.asyncio
 async def test_write_and_read(cfg):
     result = await ws_write_file(cfg=cfg, path="hello.txt", content="Hello world\nLine 2\n")
@@ -497,7 +506,7 @@ async def test_report_publish_blocks_missing_required_display_facts(cfg):
 
 
 @pytest.mark.asyncio
-async def test_report_publish_blocks_required_analytical_review_findings(cfg):
+async def test_report_publish_treats_analytical_findings_as_advisory_by_default(cfg):
     designed = await report_design_report(
         cfg=cfg,
         llm=_creative_llm(),
@@ -516,18 +525,44 @@ async def test_report_publish_blocks_required_analytical_review_findings(cfg):
         if finding["severity"] == "required"
     }
     assert required == {"missing_baseline_comparison"}
+    assert designed["analytical_review"]["enforcement"] == "advisory"
+    assert designed["review_lifecycle"]["gate"]["gate"] == "pass"
 
-    with pytest.raises(ValueError, match="analytical-review gate failed: missing_baseline_comparison"):
-        await report_publish(
-            cfg=cfg,
-            report_path="reports/needs-baseline.html",
-            storyboard_path="reports/needs-baseline.storyboard.json",
-            export_docx=False,
-        )
+    published = await report_publish(
+        cfg=cfg,
+        report_path="reports/needs-baseline.html",
+        storyboard_path="reports/needs-baseline.storyboard.json",
+        export_docx=False,
+    )
+
+    assert published["analytical_review"]["status"] == "attention_required"
 
 
 @pytest.mark.asyncio
-async def test_report_review_lifecycle_supports_explicit_risk_acceptance(cfg):
+async def test_strict_analytical_review_fails_before_creative_authoring(cfg):
+    llm = _creative_llm()
+
+    with pytest.raises(ValueError, match="preflight failed.*missing_baseline_comparison"):
+        await report_design_report(
+            cfg=cfg,
+            llm=llm,
+            report_goal="Forecast the remaining tournament matches.",
+            insights=[{
+                "title": "Spain lead the projection",
+                "detail": "Spain have the highest champion probability.",
+                "finding_id": "finding-strict-baseline",
+            }],
+            requirements={"analysis_review": {
+                "mode": "predictive",
+                "enforcement": "strict",
+            }},
+        )
+
+    assert llm.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_report_review_lifecycle_supports_advisory_finding_resolution(cfg):
     from dataclaw_analysis_review.tools import resolve_review_finding
 
     designed = await report_design_report(
@@ -547,7 +582,7 @@ async def test_report_review_lifecycle_supports_explicit_risk_acceptance(cfg):
         finding for finding in lifecycle["findings"]
         if finding["report_finding_id"] == "missing_baseline_comparison"
     )
-    assert lifecycle["gate"]["gate"] == "fail"
+    assert lifecycle["gate"]["gate"] == "pass"
 
     accepted = await resolve_review_finding(
         finding_id=baseline["finding_id"],
@@ -572,7 +607,7 @@ async def test_report_review_lifecycle_supports_explicit_risk_acceptance(cfg):
 
 
 @pytest.mark.asyncio
-async def test_report_publish_recomputes_a_tampered_analytical_review(cfg):
+async def test_report_publish_recomputes_a_tampered_advisory_review(cfg):
     designed = await report_design_report(
         cfg=cfg,
         llm=_creative_llm(),
@@ -586,16 +621,16 @@ async def test_report_publish_recomputes_a_tampered_analytical_review(cfg):
     storyboard["analytical_review"] = {"status": "pass", "findings": []}
     storyboard_path.write_text(json.dumps(storyboard), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="analytical-review gate failed: missing_baseline_comparison"):
-        await report_publish(
-            cfg=cfg,
-            report_path="reports/tampered-review.html",
-            storyboard_path="reports/tampered-review.storyboard.json",
-            export_docx=False,
-        )
+    published = await report_publish(
+        cfg=cfg,
+        report_path="reports/tampered-review.html",
+        storyboard_path="reports/tampered-review.storyboard.json",
+        export_docx=False,
+    )
 
     refreshed = json.loads(storyboard_path.read_text())
     assert refreshed["analytical_review"]["status"] == "attention_required"
+    assert published["analytical_review"]["status"] == "attention_required"
 
 
 @pytest.mark.asyncio
