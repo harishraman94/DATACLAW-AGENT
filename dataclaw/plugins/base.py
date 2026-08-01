@@ -25,6 +25,7 @@ class PluginContext:
     config: DataclawConfig
     tool_registry: Any  # DefaultToolAvailability (avoid circular import)
     guardrail_registry: Any = None  # GuardrailRegistry (avoid circular import)
+    session_cleanup_registry: Any = None  # SessionCleanupRegistry
 
     @property
     def sub_agent_registry(self):
@@ -53,7 +54,7 @@ class PluginPage:
 class PluginConfigField:
     """Describes a config field for the plugin's UI config section."""
     name: str
-    field_type: str  # "string" | "int" | "bool" | "select"
+    field_type: str  # "string" | "secret" | "int" | "bool" | "select"
     label: str
     description: str = ""
     default: Any = None

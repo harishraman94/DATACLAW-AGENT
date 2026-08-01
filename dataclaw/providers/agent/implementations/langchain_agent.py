@@ -62,6 +62,12 @@ class LangChainAgentProvider:
         system_dynamic = state.get("system_prompt_dynamic", "")
         if system_dynamic:
             extra_kwargs["system_dynamic"] = system_dynamic
+        # Per-turn reasoning budget. Set by upstream nodes/hooks for turns that
+        # warrant deeper thinking (e.g. the plans plugin elevates it while a plan
+        # is being drafted). Unset on ordinary turns leaves the model at default.
+        reasoning_effort = state.get("reasoning_effort")
+        if reasoning_effort:
+            extra_kwargs["reasoning_effort"] = reasoning_effort
 
         async for event in self._llm.stream_turn(
             messages, system=system, tools=tools, **extra_kwargs

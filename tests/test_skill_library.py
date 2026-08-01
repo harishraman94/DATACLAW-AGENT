@@ -3,7 +3,15 @@
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
+from dataclaw.api.routers.skills import (
+    SkillRequest,
+    create_skill,
+    list_skills,
+    remove_skill,
+    update_skill,
+)
 from dataclaw.storage.skill_library import (
     install_library_skill,
     list_library_skills,
@@ -184,9 +192,9 @@ def test_list_marks_stale_installed_library_skill(library_dir, user_skills_dir):
 
 
 def test_list_marks_legacy_unmarked_library_skill_stale(library_dir, user_skills_dir):
-    _write_library_skill(library_dir, "dashboarding", "name: dashboarding", "new body")
-    (user_skills_dir / "dashboarding.md").write_text(
-        "---\nname: dashboarding\n---\n\nold body\n",
+    _write_library_skill(library_dir, "sample_skill", "name: sample_skill", "new body")
+    (user_skills_dir / "sample_skill.md").write_text(
+        "---\nname: sample_skill\n---\n\nold body\n",
         encoding="utf-8",
     )
 
@@ -196,18 +204,170 @@ def test_list_marks_legacy_unmarked_library_skill_stale(library_dir, user_skills
     assert result[0]["legacy_library_inferred"] is True
 
     stale = stale_installed_library_skills()
-    assert stale[0]["id"] == "dashboarding"
+    assert stale[0]["id"] == "sample_skill"
     assert stale[0]["legacy_library_inferred"] is True
 
 
 def test_read_marks_hash_based_library_change(library_dir, user_skills_dir):
-    _write_library_skill(library_dir, "dashboarding", "name: dashboarding", "new body")
-    (user_skills_dir / "dashboarding.md").write_text(
-        "---\nname: dashboarding\nsource: library\nlibrary_id: dashboarding\nlibrary_hash: oldhash\n---\n\nold body\n",
+    _write_library_skill(library_dir, "sample_skill", "name: sample_skill", "new body")
+    (user_skills_dir / "sample_skill.md").write_text(
+        "---\nname: sample_skill\nsource: library\nlibrary_id: sample_skill\nlibrary_hash: oldhash\n---\n\nold body\n",
         encoding="utf-8",
     )
 
-    result = read_library_skill("dashboarding")
+    result = read_library_skill("sample_skill")
     assert result["installed"] is True
     assert result["installed_stale"] is True
     assert result["stale_reason"] == "library_skill_changed"
+
+
+@pytest.mark.asyncio
+async def test_installed_skills_api_rechecks_live_library_freshness(
+    library_dir,
+    user_skills_dir,
+):
+    _write_library_skill(library_dir, "visualization", "name: Visualization", "new body")
+    (user_skills_dir / "visualization.md").write_text(
+        "---\n"
+        "name: Visualization\n"
+        "source: library\n"
+        "library_id: visualization\n"
+        "library_hash: oldhash\n"
+        "---\n\n"
+        "old body\n",
+        encoding="utf-8",
+    )
+    (user_skills_dir / "custom.md").write_text(
+        "---\nname: Custom\n---\n\ncustom body\n",
+        encoding="utf-8",
+    )
+
+    result = {skill["id"]: skill for skill in await list_skills()}
+
+    assert result["visualization"]["installed_stale"] is True
+    assert result["visualization"]["stale_reason"] == "library_skill_changed"
+    assert result["visualization"]["library_id"] == "visualization"
+    assert result["custom"]["installed_stale"] is False
+
+
+# ── skill write protections ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_installed_library_skill_is_read_only(library_dir, user_skills_dir):
+    _write_library_skill(library_dir, "profiling", "name: Profiling", "Original body")
+    install_library_skill("profiling")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_skill(
+            "profiling",
+            SkillRequest(name="Changed", description="", tags=[], body="Changed body"),
+        )
+
+    assert exc_info.value.status_code == 403
+    assert "Duplicate" in exc_info.value.detail
+    assert "Original body" in (user_skills_dir / "profiling.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_legacy_installed_library_skill_is_read_only(library_dir, user_skills_dir):
+    _write_library_skill(library_dir, "profiling", "name: Profiling", "Library body")
+    path = user_skills_dir / "profiling.md"
+    path.write_text("---\nname: Profiling\n---\n\nLegacy installed body\n", encoding="utf-8")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_skill(
+            "profiling",
+            SkillRequest(name="Changed", description="", tags=[], body="Changed body"),
+        )
+
+    assert exc_info.value.status_code == 403
+    assert "Legacy installed body" in path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_custom_skill_remains_editable(user_skills_dir):
+    (user_skills_dir / "custom.md").write_text(
+        "---\nname: Custom\n---\n\nOriginal body\n",
+        encoding="utf-8",
+    )
+
+    result = await update_skill(
+        "custom",
+        SkillRequest(name="Updated Custom", description="Updated", tags=["mine"], body="New body"),
+    )
+
+    assert result["status"] == "updated"
+    content = (user_skills_dir / "custom.md").read_text()
+    assert "Updated Custom" in content
+    assert "New body" in content
+
+
+@pytest.mark.asyncio
+async def test_custom_skill_cannot_use_library_skill_id(library_dir):
+    _write_library_skill(library_dir, "profiling", "name: Profiling", "Library body")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_skill(
+            "profiling",
+            SkillRequest(name="Profiling", description="", tags=[], body="Custom body"),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "reserved by a library skill" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_library_skill_can_be_duplicated_as_custom(library_dir, user_skills_dir):
+    _write_library_skill(
+        library_dir,
+        "profiling",
+        "name: Profiling\ndescription: Profile data\ntags:\n  - data",
+        "Library instructions",
+    )
+    source = read_library_skill("profiling")
+
+    result = await create_skill(
+        "profiling_copy",
+        SkillRequest(
+            name=f"{source['name']} Copy",
+            description=source["description"],
+            tags=source["tags"],
+            body=source["body"],
+        ),
+    )
+
+    assert result["status"] == "created"
+    content = (user_skills_dir / "profiling_copy.md").read_text()
+    assert "Profiling Copy" in content
+    assert "Library instructions" in content
+    assert "source: library" not in content
+
+
+@pytest.mark.asyncio
+async def test_uninstall_removes_only_installed_library_copy(library_dir, user_skills_dir):
+    library_path = library_dir / "profiling.md"
+    _write_library_skill(library_dir, "profiling", "name: Profiling", "Library body")
+    install_library_skill("profiling")
+
+    result = await remove_skill("profiling")
+
+    assert result["status"] == "deleted"
+    assert not (user_skills_dir / "profiling.md").exists()
+    assert library_path.exists()
+    assert read_library_skill("profiling")["installed"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_does_not_overwrite_existing_custom_skill(user_skills_dir):
+    path = user_skills_dir / "custom.md"
+    path.write_text("---\nname: Custom\n---\n\nKeep me\n", encoding="utf-8")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_skill(
+            "custom",
+            SkillRequest(name="Custom", description="", tags=[], body="Replacement"),
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "Keep me" in path.read_text()

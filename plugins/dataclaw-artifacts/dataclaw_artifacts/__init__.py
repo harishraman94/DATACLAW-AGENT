@@ -25,6 +25,13 @@ class ArtifactsPlugin:
         ctx.include_api_router(artifacts_router, prefix="/artifacts", tags=["artifacts"])
         ctx.hooks.register("preToolCallHook", artifact_context_hook)
         ctx.hooks.register("postToolCallHook", artifact_capture_hook)
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_artifacts.store import delete_session_artifacts
+
+            ctx.session_cleanup_registry.register(
+                "artifacts",
+                lambda session: delete_session_artifacts(str(session.get("id") or "")),
+            )
 
         tools = [
             (

@@ -7,12 +7,52 @@ from dataclaw.api.app import create_app
 from dataclaw_artifacts.store import read_manifest_events
 
 
+def test_tool_invocation_requires_a_live_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
+
+    with TestClient(create_app()) as client:
+        missing_id = "missing-session"
+        direct_without_session = client.post(
+            "/api/tools/list_skills/invoke",
+            json={"params": {}},
+        )
+        direct_missing_session = client.post(
+            "/api/tools/list_skills/invoke",
+            json={"session_id": missing_id, "params": {}},
+        )
+        proxy_missing_session = client.post(
+            "/api/tools/list_skills/call",
+            json={"session_id": missing_id, "params": {}},
+        )
+        agent_missing_session = client.post(
+            "/api/agent",
+            json={
+                "thread_id": missing_id,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        callback_missing_session = client.post(
+            f"/api/chat/sessions/{missing_id}/message",
+            json={"role": "assistant", "content": "late response"},
+        )
+
+        assert direct_without_session.status_code == 400
+        assert direct_missing_session.status_code == 404
+        assert proxy_missing_session.status_code == 404
+        assert agent_missing_session.status_code == 404
+        assert callback_missing_session.status_code == 404
+
+
 def test_direct_tool_invoke_applies_artifact_context_hooks(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
 
     with TestClient(create_app()) as client:
+        session_id = client.post(
+            "/api/chat/sessions",
+            json={"title": "Direct tool session"},
+        ).json()["id"]
         response = client.post("/api/tools/publish_artifact/invoke", json={
-            "session_id": "direct-session",
+            "session_id": session_id,
             "params": {
                 "title": "Direct Invoke Artifact",
                 "html": (
@@ -26,11 +66,11 @@ def test_direct_tool_invoke_applies_artifact_context_hooks(tmp_path, monkeypatch
         assert response.status_code == 200
         result = response.json()["result"]
         assert result["success"] is True
-        assert result["session_id"] == "direct-session"
+        assert result["session_id"] == session_id
 
         session_listing = client.get(
             "/api/artifacts",
-            params={"session_id": "direct-session"},
+            params={"session_id": session_id},
         ).json()
         ids = {artifact["artifact_id"] for artifact in session_listing["artifacts"]}
         assert result["artifact_id"] in ids
@@ -72,14 +112,14 @@ def test_direct_tool_invoke_applies_artifact_context_hooks(tmp_path, monkeypatch
         assert "window.Plotly" in runtime.text or "Plotly.register" in runtime.text
 
         export_tool = client.post("/api/tools/export_artifact/invoke", json={
-            "session_id": "direct-session",
+            "session_id": session_id,
             "params": {"artifact_id": result["artifact_id"], "version": result["version"]},
         })
         assert export_tool.status_code == 200
         export_result = export_tool.json()["result"]
         assert export_result["success"] is True
         assert export_result["download_url"].endswith(
-            f"version={result['version']}&session_id=direct-session"
+            f"version={result['version']}&session_id={session_id}"
         )
 
         exported = client.get(export_result["download_url"])
@@ -90,43 +130,16 @@ def test_direct_tool_invoke_applies_artifact_context_hooks(tmp_path, monkeypatch
         assert "window.Plotly" in exported.text or "Plotly.register" in exported.text
 
 
-def test_direct_report_section_logs_living_report_event(tmp_path, monkeypatch):
-    monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
-
-    with TestClient(create_app()) as client:
-        response = client.post("/api/tools/report_add_section/invoke", json={
-            "session_id": "section-session",
-            "params": {
-                "section_type": "findings",
-                "report_path": "reports/live.html",
-                "data": {
-                    "title": "Key findings",
-                    "items": [{
-                        "title": "Value follows consistency",
-                        "detail": "Consistency dominates raw volume.",
-                    }],
-                },
-            },
-        })
-
-        assert response.status_code == 200
-        result = response.json()["result"]
-        assert result["updated"] is True
-
-        listed = client.get("/api/artifacts", params={"session_id": "section-session"}).json()
-        living = listed["artifacts"][0]
-        events = read_manifest_events(living["artifact_id"])
-        assert events[0]["kind"] == "report_section"
-        assert events[0]["payload"]["section_type"] == "findings"
-        assert events[0]["payload"]["title"] == "Key findings"
-
-
 def test_openclaw_tool_proxy_runs_artifact_post_hooks(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
 
     with TestClient(create_app()) as client:
+        session_id = client.post(
+            "/api/chat/sessions",
+            json={"title": "OpenClaw tool session"},
+        ).json()["id"]
         response = client.post("/api/tools/publish_artifact/call", json={
-            "session_id": "openclaw-session",
+            "session_id": session_id,
             "params": {
                 "title": "OpenClaw Artifact",
                 "description": "Published through OpenClaw proxy",
@@ -138,7 +151,7 @@ def test_openclaw_tool_proxy_runs_artifact_post_hooks(tmp_path, monkeypatch):
         result = response.json()["result"]
         assert result["success"] is True
 
-        listed = client.get("/api/artifacts", params={"session_id": "openclaw-session"}).json()
+        listed = client.get("/api/artifacts", params={"session_id": session_id}).json()
         living = listed["artifacts"][0]
         events = read_manifest_events(living["artifact_id"])
         assert events[0]["kind"] == "artifact_published"

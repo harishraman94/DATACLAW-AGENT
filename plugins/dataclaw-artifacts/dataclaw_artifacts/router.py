@@ -13,7 +13,6 @@ from dataclaw_artifacts.store import (
     artifact_url,
     delete_artifact_record,
     ensure_artifact_session,
-    ensure_living_report,
     latest_version,
     list_artifact_records,
     living_report_url,
@@ -38,8 +37,6 @@ def _headers(disposition: str | None = None, *, nonce: str | None = None) -> dic
 
 @router.get("")
 async def list_artifacts(session_id: str = "", limit: int = 100) -> dict[str, Any]:
-    if session_id:
-        ensure_living_report(session_id, touch=False)
     artifacts = []
     for meta in list_artifact_records(session_id=session_id, limit=limit):
         latest = int(meta.get("latest_version") or 0)

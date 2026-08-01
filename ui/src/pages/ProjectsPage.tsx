@@ -9,9 +9,19 @@ interface Project {
   kernel?: { mode: string; python_version: string; packages: string[] }
 }
 
+const MLFLOW_PACKAGE = 'mlflow==3.14.0'
+
 const REQUIRED_PACKAGES = [
-  'ipykernel', 'requests', 'duckdb', 'mlflow',
+  'ipykernel', 'requests', 'duckdb', MLFLOW_PACKAGE,
 ]
+
+const packageName = (requirement: string) =>
+  requirement.trim().split(/[\s<>=!~[;]/, 1)[0].toLowerCase().replaceAll('_', '-')
+
+const ensureRequiredPackages = (packages: string[]) => {
+  const requiredNames = new Set(REQUIRED_PACKAGES.map(packageName))
+  return [...REQUIRED_PACKAGES, ...packages.filter(p => !requiredNames.has(packageName(p)))]
+}
 
 const DEFAULT_PACKAGES = [
   ...REQUIRED_PACKAGES,
@@ -164,14 +174,13 @@ export default function ProjectsPage() {
                 <Field label="Packages to install">
                   <Select mode="tags" value={form.packages}
                     onChange={v => {
-                      const withRequired = [...new Set([...REQUIRED_PACKAGES, ...v])]
-                      setForm(f => ({ ...f, packages: withRequired }))
+                      setForm(f => ({ ...f, packages: ensureRequiredPackages(v) }))
                     }}
                     style={{ width: '100%' }} placeholder="Type to add packages"
                     options={COMMON_PACKAGES.map(p => ({ value: p, label: p }))} />
                   <div style={{ fontSize: 11, color: '#999', marginTop: 2 }}>
                     Type a package name and press Enter to add custom packages.
-                    Required packages (ipykernel, requests, duckdb, mlflow) cannot be removed.
+                    Required packages (ipykernel, requests, duckdb, MLflow 3.14.0) cannot be removed.
                   </div>
                 </Field>
               </>

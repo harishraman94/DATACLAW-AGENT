@@ -4,6 +4,8 @@ description: Create structured Jupyter notebook reports with narrative, code, an
 tags: [notebooks, reporting, visualization]
 ---
 
+**Related skills:** `visualization` (charts and visual evidence), `report_design` (for a polished published report instead of a notebook).
+
 When asked to create a report or analysis notebook, follow this structure:
 
 ## Notebook structure

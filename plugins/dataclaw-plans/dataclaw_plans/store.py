@@ -73,6 +73,41 @@ def write_snapshots(snapshots: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(snapshots, indent=2, default=str), encoding="utf-8")
 
 
+def delete_session_records(session_id: str) -> dict[str, Any]:
+    """Remove one session's plans and snapshots from the shared JSON stores."""
+    proposals = read_proposals()
+    removed_proposal_ids = {
+        str(proposal.get("id") or "")
+        for proposal in proposals
+        if str(proposal.get("session_id") or "") == session_id
+    }
+    kept_proposals = [
+        proposal
+        for proposal in proposals
+        if str(proposal.get("session_id") or "") != session_id
+    ]
+    if len(kept_proposals) != len(proposals):
+        write_proposals(kept_proposals)
+
+    snapshots = read_snapshots()
+    kept_snapshots = [
+        snapshot
+        for snapshot in snapshots
+        if (
+            str(snapshot.get("proposal_id") or "") not in removed_proposal_ids
+            and str((snapshot.get("plan") or {}).get("session_id") or "") != session_id
+        )
+    ]
+    removed_snapshots = len(snapshots) - len(kept_snapshots)
+    if removed_snapshots:
+        write_snapshots(kept_snapshots)
+
+    return {
+        "removed_plans": len(proposals) - len(kept_proposals),
+        "removed_snapshots": removed_snapshots,
+    }
+
+
 def append_snapshot(proposal: dict[str, Any], trigger: str) -> dict[str, Any]:
     """Persist a deep-copied snapshot of `proposal` and return the snapshot record.
 

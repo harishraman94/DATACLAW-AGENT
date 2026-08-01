@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclaw.api.routers.chat import IncomingMessage, _extract_visual_artifacts, _stored_messages_to_llm, receive_message
+from dataclaw.capability_receipts import build_capability_receipt, record_tool_execution
 
 
 def _tool_call_msg(call_id: str, result: str, result_for_llm: str | None = None) -> dict:
@@ -18,6 +19,47 @@ def _tool_call_msg(call_id: str, result: str, result_for_llm: str | None = None)
     if result_for_llm is not None:
         msg["result_for_llm"] = result_for_llm
     return msg
+
+
+def test_reviewer_internal_skill_use_is_recorded_in_capability_receipt():
+    receipt = build_capability_receipt(
+        run_id="review-run",
+        skills=[{
+            "id": "analysis_review",
+            "name": "Analysis review",
+            "body": "rubric",
+            "source": "local",
+        }],
+        tools=[{"name": "request_analysis_review", "source": "plugin:analysis-review"}],
+    )
+
+    record_tool_execution(
+        receipt,
+        tool_name="request_analysis_review",
+        call_id="review-call",
+        result={
+            "success": True,
+            "reviewer_skill": {
+                "id": "analysis_review",
+                "name": "Analysis review",
+                "source": "installed",
+                "origin": "local",
+                "sha256": "abc123",
+            },
+        },
+        status="complete",
+    )
+
+    assert receipt["skills"]["used"] == [{
+        "id": "analysis_review",
+        "serialId": "analysis_review",
+        "name": "Analysis review",
+        "source": "installed",
+        "origin": "local",
+        "sha256": "abc123",
+        "callId": "review-call",
+        "usedBy": "analysis-reviewer",
+    }]
 
 
 def test_stored_messages_prefer_result_for_llm():
@@ -187,6 +229,12 @@ async def test_openclaw_tool_call_message_persists_as_dataclaw_tool_call():
     from dataclaw.storage import sessions
 
     created = await sessions.create_session(title="OpenClaw tool call")
+    receipt = build_capability_receipt(
+        run_id="external-run",
+        skills=[],
+        tools=[{"name": "report_add_section", "source": "plugin:artifacts"}],
+    )
+    await sessions.upsert_capability_receipt(created["id"], receipt)
     await receive_message(
         created["id"],
         IncomingMessage(
@@ -215,6 +263,14 @@ async def test_openclaw_tool_call_message_persists_as_dataclaw_tool_call():
     assert msg["startedAt"] == "2026-07-14T09:00:00+00:00"
     assert msg["finishedAt"] == "2026-07-14T09:00:04+00:00"
     assert loaded["visualArtifacts"][0]["kind"] == "report"
+    receipt = loaded["capabilityReceipts"][0]
+    assert receipt["tools"]["used"][0] == {
+        "name": "report_add_section",
+        "source": "plugin:artifacts",
+        "callId": "oc-1",
+        "status": "complete",
+    }
+    assert receipt["outputs"][0]["visualArtifacts"][0]["kind"] == "report"
 
 
 async def test_openclaw_tool_call_message_redacts_llm_result():

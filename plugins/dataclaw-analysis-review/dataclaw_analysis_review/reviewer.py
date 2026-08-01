@@ -1,9 +1,9 @@
 """Reviewer sub-agent execution — P6 (FR-28/FR-29, D12).
 
 The reviewer runs through the sub-agent provider registry directly (D12), never
-through the chat-facing ``delegate_to_subagent`` tool — that keeps per-session
-allowlists and conversation persistence out of the loop while sub-agent hooks
-and events still fire. It receives a structured context manifest (FR-26) —
+through the chat-facing ``delegate_to_subagent`` tool — conversation persistence
+stays out of the loop while the same session capability scope, sub-agent hooks,
+and events still apply. It receives a structured context manifest (FR-26) —
 never raw artifact HTML — plus a read-only metadata toolset, so it audits
 coherence between claims, ledger state, and evidence anchors; it cannot
 recompute results (D7). It returns findings as fenced JSON and never mutates
@@ -12,6 +12,7 @@ analysis state (FR-29).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -111,25 +112,8 @@ def ensure_reviewer_definition() -> dict[str, Any]:
     return definition
 
 
-def render_reviewer_system_prompt() -> str:
-    """Rubric skill body (installed first, bundled fallback) + output contract."""
-    body = ""
-    try:
-        from dataclaw.storage.skills import read_skill
-
-        installed = read_skill("analysis_review")
-        if installed:
-            body = str(installed.get("body") or "")
-    except Exception:
-        body = ""
-    if not body.strip():
-        try:
-            from dataclaw.storage.skill_library import read_library_skill
-
-            library = read_library_skill("analysis_review")
-            body = str((library or {}).get("body") or "")
-        except Exception:
-            body = ""
+def render_reviewer_system_prompt(body: str = "") -> str:
+    """Render an explicitly resolved installed rubric or the built-in rubric."""
     if not body.strip():
         body = (
             "You are the analysis reviewer. Audit hypothesis-ledger coverage first, "
@@ -200,7 +184,7 @@ def parse_reviewer_findings(text: str) -> list[dict[str, Any]] | None:
     return findings
 
 
-async def run_reviewer(task: str) -> dict[str, Any]:
+async def run_reviewer(task: str, *, session_id: str) -> dict[str, Any]:
     """Run the reviewer via the provider registry. Raises RuntimeError when unavailable."""
     from dataclaw.providers.sub_agent.provider import SubAgentContext
 
@@ -211,17 +195,53 @@ async def run_reviewer(task: str) -> dict[str, Any]:
 
     tool_registry = _runtime.get("tool_registry")
     allowed = set(definition.get("allowed_tools") or REVIEWER_ALLOWED_TOOLS)
-    tools: list[dict[str, Any]] = []
-    tool_callables: dict[str, Any] = {}
-    for name, tool in getattr(tool_registry, "_tools", {}).items():
-        if name not in allowed:
-            continue
-        tools.append(tool.definition)
-        tool_callables[name] = tool.execute
+    project_id = ""
+    try:
+        from dataclaw.storage.sessions import get_session
+
+        session = await get_session(session_id)
+        project_id = str((session or {}).get("projectId") or "")
+    except Exception:
+        pass
+    state = {
+        "session_id": session_id,
+        "project_id": project_id,
+        "messages": [],
+    }
+    resolved_tools, resolved_callables = await tool_registry.resolve_tools(state)
+    tools = [
+        definition
+        for definition in resolved_tools
+        if str(definition.get("name") or "") in allowed
+    ]
+    tool_callables = {
+        name: fn
+        for name, fn in resolved_callables.items()
+        if name in allowed
+    }
+
+    rubric_body = ""
+    rubric_skill: dict[str, Any] | None = None
+    skill_provider = getattr(_runtime.get("providers"), "skill", None)
+    if skill_provider is not None:
+        resolved_skills = await skill_provider.resolve_skills(state)
+        selected = next(
+            (skill for skill in resolved_skills if skill.get("id") == "analysis_review"),
+            None,
+        )
+        if selected is not None:
+            rubric_body = str(selected.get("body") or "")
+            rubric_skill = {
+                "id": "analysis_review",
+                "name": str(selected.get("name") or "analysis_review"),
+                "source": "installed",
+                "origin": str(selected.get("source") or "local"),
+                "sha256": hashlib.sha256(rubric_body.encode("utf-8")).hexdigest(),
+            }
 
     config = dict(definition.get("config") or {})
     config["max_turns"] = int(config.get("max_turns") or REVIEWER_MAX_TURNS)
-    config["system_prompt"] = render_reviewer_system_prompt()
+    config["system_prompt"] = render_reviewer_system_prompt(rubric_body)
 
     context = SubAgentContext(
         definition=definition,
@@ -235,4 +255,5 @@ async def run_reviewer(task: str) -> dict[str, Any]:
         "status": result.status,
         "result": result.result,
         "turns_used": result.turns_used,
+        "reviewer_skill": rubric_skill,
     }

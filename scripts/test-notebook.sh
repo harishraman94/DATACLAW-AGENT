@@ -36,7 +36,7 @@ PROJECT=$(curl -s -X POST "$API/projects/" \
     "name": "kernel-test",
     "description": "Test notebook kernel creation",
     "kernel_mode": "new_env",
-    "packages": ["ipykernel", "pandas", "numpy", "duckdb", "requests", "mlflow"]
+    "packages": ["ipykernel", "pandas", "numpy", "duckdb", "requests", "mlflow==3.14.0"]
   }')
 PROJECT_ID=$(echo "$PROJECT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 echo "   Project ID: $PROJECT_ID"

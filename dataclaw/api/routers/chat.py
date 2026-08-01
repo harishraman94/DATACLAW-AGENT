@@ -22,6 +22,11 @@ from pydantic import BaseModel
 
 from dataclaw.api.context import current_emitter, current_thread_id
 from dataclaw.api.run_tracker import RunState, get_run_tracker
+from dataclaw.capability_receipts import (
+    build_capability_receipt,
+    finish_capability_receipt,
+    record_tool_execution,
+)
 from dataclaw.config.resolver import resolve
 from dataclaw.events.emitter import AgentEventEmitter
 # Use text/event-stream so @ag-ui/client routes to the SSE parser (not protobuf)
@@ -33,6 +38,7 @@ from dataclaw.providers.llm.provider import PendingToolCall, TextDeltaEvent, Too
 from dataclaw.providers.tool.llm_redact import redact_for_llm
 from dataclaw.schema import Message
 from dataclaw.storage import sessions
+from dataclaw.tool_progress import tool_progress_context
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +46,18 @@ router = APIRouter()
 agent_router = APIRouter()
 
 APP_CELL_OUTPUT_TOOLS = {"execute_cell", "display_cell_output", "execute_code"}
-APP_REPORT_TOOLS = {"build_report", "report_design_report", "report_add_section", "report_publish"}
+# report_design_report and report_publish are the active report tools; build_report
+# and report_add_section were removed but are kept here so reports produced by those
+# tools in older sessions still resolve to a report artifact on reload.
+APP_REPORT_TOOLS = {"report_design_report", "report_publish", "build_report", "report_add_section"}
+
+
+def _max_turns_notice(max_turns: int) -> str:
+    return (
+        f"The configured limit of {max_turns} agent turns was reached before the task "
+        "finished. Your progress has been saved. Send \"Continue from where you "
+        "stopped\" to resume."
+    )
 
 
 def _stable_app_payload_key(payload: Any) -> str:
@@ -187,6 +204,24 @@ async def _run_agent_loop(
     current_emitter.set(emitter)
 
     emit(emitter.run_started())
+    capability_receipt: dict[str, Any] | None = None
+
+    async def persist_capability_receipt(
+        status: str | None = None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Best-effort audit persistence that must never break the run."""
+        if capability_receipt is None:
+            return
+        if status is not None:
+            finish_capability_receipt(capability_receipt, status, reason=reason)
+        try:
+            await sessions.upsert_capability_receipt(thread_id, capability_receipt)
+        except Exception:
+            logger.exception(
+                "Failed to persist capability receipt for run %s", run_id
+            )
 
     try:
         # Persist user message first
@@ -236,40 +271,52 @@ async def _run_agent_loop(
             state = await hooks.run("preCompactionHook", state)
             compacted = await providers.compaction.compact(current_messages, **compact_kwargs)
 
-            # Extract the summary from the compacted result (first system message)
-            summary_text = ""
-            if compacted and compacted[0].role == "system":
-                summary_text = compacted[0].text() if hasattr(compacted[0], "text") else str(compacted[0].content)
+            # A compactor can decline or fail safely and return the original
+            # list. Do not persist an empty/misleading divider in that case.
+            if compacted is current_messages:
+                compacted = current_messages
+            else:
+                # Extract the summary from the compacted result (first system message)
+                summary_text = ""
+                if compacted and compacted[0].role == "system":
+                    summary_text = compacted[0].text() if hasattr(compacted[0], "text") else str(compacted[0].content)
 
-            # Count how many messages were compacted vs kept
-            keep_recent = compact_kwargs["keep_recent"]
-            compacted_count = max(0, len(sorted_msgs) - keep_recent)
-            kept_count = min(keep_recent, len(sorted_msgs))
+                recent_messages = compacted[1:] if compacted and compacted[0].role == "system" else compacted
+                kept_turns = sum(1 for message in recent_messages if message.role == "user")
+                split_idx, compacted_count, kept_count = _stored_compaction_span(
+                    sorted_msgs, kept_turns
+                )
 
-            # Insert the marker at the split point: right before the kept messages
-            # so the UI shows <old history> <compaction divider> <recent messages>
-            marker_id = f"compaction-{uuid.uuid4()}"
-            insert_idx = compacted_count  # position after old messages, before recent
-            await sessions.insert_message_at(thread_id, insert_idx, {
-                "role": "compaction",
-                "content": summary_text,
-                "messageId": marker_id,
-                "compactedCount": compacted_count,
-                "keptCount": kept_count,
-            })
+                # ``sorted_msgs`` and ``stored_msgs`` contain the same dict
+                # objects in different orders. Insert into the persisted/raw
+                # order immediately before the chronological split target.
+                split_target = sorted_msgs[split_idx] if split_idx < len(sorted_msgs) else None
+                insert_idx = next(
+                    (idx for idx, message in enumerate(stored_msgs) if message is split_target),
+                    len(stored_msgs),
+                )
 
-            # Emit SSE event so frontend shows the compaction in real-time.
-            # Send the full summary — the divider is collapsible, so a long
-            # summary doesn't crowd the chat by default but can be expanded.
-            emit(emitter.custom("compaction", {
-                "messageId": marker_id,
-                "summary": summary_text,
-                "compactedCount": compacted_count,
-                "keptCount": kept_count,
-            }))
+                marker_id = f"compaction-{uuid.uuid4()}"
+                marker = _build_compaction_marker(
+                    marker_id=marker_id,
+                    summary_text=summary_text,
+                    compacted_count=compacted_count,
+                    kept_count=kept_count,
+                    split_target=split_target,
+                )
+                await sessions.insert_message_at(thread_id, insert_idx, marker)
 
-            state["messages"] = compacted
-            state = await hooks.run("postCompactionHook", state)
+                # Send the full summary — the divider is collapsible, so a
+                # long summary does not crowd the chat until expanded.
+                emit(emitter.custom("compaction", {
+                    "messageId": marker_id,
+                    "summary": summary_text,
+                    "compactedCount": compacted_count,
+                    "keptCount": kept_count,
+                }))
+
+                state["messages"] = compacted
+                state = await hooks.run("postCompactionHook", state)
 
         # Memory (before system prompt so memories can be injected into it)
         memories = await providers.memory.retrieve_memories(state)
@@ -305,6 +352,15 @@ async def _run_agent_loop(
         state["tools"] = tool_defs
         state["tool_callables"] = tool_callables
         state = await hooks.run("postToolAvailabilityHook", state)
+
+        receipt_skills = state.get("skills", skills)
+        receipt_tools = state.get("tools", tool_defs)
+        capability_receipt = build_capability_receipt(
+            run_id=run_id,
+            skills=list(receipt_skills) if isinstance(receipt_skills, list) else skills,
+            tools=list(receipt_tools) if isinstance(receipt_tools, list) else tool_defs,
+        )
+        await persist_capability_receipt()
 
         # Set prompt cache key for providers that support it (e.g. OpenAI Responses API).
         from dataclaw.providers.llm.implementations.openai_responses import OpenAIResponsesLLM
@@ -369,6 +425,31 @@ async def _run_agent_loop(
                             run = tracker.get_run(thread_id)
                             if run:
                                 await run._completion.wait()
+                            # External callbacks update the persisted receipt
+                            # while this task is waiting. Merge that audit trail
+                            # before applying the terminal status.
+                            persisted = await sessions.get_session(thread_id)
+                            persisted_receipts = (
+                                (persisted or {}).get("capabilityReceipts") or []
+                            )
+                            external_receipt = next(
+                                (
+                                    receipt
+                                    for receipt in persisted_receipts
+                                    if isinstance(receipt, dict)
+                                    and receipt.get("runId") == run_id
+                                ),
+                                None,
+                            )
+                            if (
+                                capability_receipt is not None
+                                and isinstance(external_receipt, dict)
+                            ):
+                                capability_receipt.clear()
+                                capability_receipt.update(external_receipt)
+                            await persist_capability_receipt(
+                                "completed", reason="external_provider"
+                            )
                             return
                         else:
                             # Normal provider — persist and finish.
@@ -390,6 +471,7 @@ async def _run_agent_loop(
                                 except Exception:
                                     logger.exception("Failed to bump autoTurnsUsed")
                             state = await hooks.run("postAgentMessageHook", state)
+                            await persist_capability_receipt("completed")
                             emit(emitter.run_finished())
                             tracker.finish_run(thread_id)
                             return
@@ -563,9 +645,44 @@ async def _run_agent_loop(
                             "args": json.dumps(tc.tool_input, default=str),
                             "result": result_json, "status": "error", **tool_timing(tc.call_id),
                         })
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result={"error": f"Unknown tool: {tc.tool_name}"},
+                                status="error",
+                            )
+                            await persist_capability_receipt()
                         continue
+                    tracker.start_tool(thread_id, tc.call_id, tc.tool_name)
+                    tool_started = asyncio.get_running_loop().time()
+                    tool_execution_started_at = datetime.now(timezone.utc).isoformat()
+
+                    def report_progress(
+                        progress: dict[str, Any],
+                        *,
+                        call_id: str = tc.call_id,
+                        tool_name: str = tc.tool_name,
+                        started: float = tool_started,
+                    ) -> None:
+                        payload = {
+                            "toolCallId": call_id,
+                            "toolName": tool_name,
+                            "startedAt": tool_execution_started_at,
+                            "elapsedMs": round(
+                                (asyncio.get_running_loop().time() - started) * 1000
+                            ),
+                            "emittedAt": datetime.now(timezone.utc).isoformat(),
+                            **progress,
+                        }
+                        tracker.update_tool_progress(thread_id, call_id, payload)
+                        emit(emitter.custom("tool:progress", payload))
+
                     try:
-                        result = await fn(**tc.tool_input)
+                        report_progress({"phase": "starting", "label": f"Starting {tc.tool_name}"})
+                        with tool_progress_context(report_progress):
+                            result = await fn(**tc.tool_input)
                         results_list.append(result)
                         errors_list.append(None)
                         result_json = json.dumps(result, default=str)
@@ -584,15 +701,26 @@ async def _run_agent_loop(
                         if llm_view_json != result_json:
                             msg_record["result_for_llm"] = llm_view_json
                         await sessions.append_message(thread_id, msg_record)
+                        visual_artifacts = _extract_visual_artifacts(
+                            tool_name=tc.tool_name,
+                            tool_call_id=tc.call_id,
+                            tool_input=tc.tool_input,
+                            result=result,
+                        )
                         await _append_visual_artifacts(
                             thread_id,
-                            _extract_visual_artifacts(
-                                tool_name=tc.tool_name,
-                                tool_call_id=tc.call_id,
-                                tool_input=tc.tool_input,
-                                result=result,
-                            ),
+                            visual_artifacts,
                         )
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result=result,
+                                status="complete",
+                                visual_artifacts=visual_artifacts,
+                            )
+                            await persist_capability_receipt()
                     except Exception as e:
                         logger.exception("Tool %s failed", tc.tool_name)
                         results_list.append({})
@@ -605,6 +733,17 @@ async def _run_agent_loop(
                             "args": json.dumps(tc.tool_input, default=str),
                             "result": result_json, "status": "error", **tool_timing(tc.call_id),
                         })
+                        if capability_receipt is not None:
+                            record_tool_execution(
+                                capability_receipt,
+                                tool_name=tc.tool_name,
+                                call_id=tc.call_id,
+                                result={"error": str(e)},
+                                status="error",
+                            )
+                            await persist_capability_receipt()
+                    finally:
+                        tracker.finish_tool(thread_id, tc.call_id)
 
                 # Build canonical messages and append to conversation. Use the
                 # redacted view of each result so the live-turn LLM context
@@ -646,27 +785,122 @@ async def _run_agent_loop(
                 if message_started:
                     emit(emitter.text_message_end(msg_id))
 
-        # Max turns reached
+        # Max turns reached. Persist a non-LLM notice so the reason remains
+        # visible after a refresh, then stream the same notice to live clients.
+        # This is an execution limit, not an API failure, so the run still ends
+        # with RUN_FINISHED rather than RUN_ERROR.
+        notice_id = f"run-notice-{run_id}"
+        notice_message = _max_turns_notice(max_turns)
+        await sessions.append_message(thread_id, {
+            "role": "run_notice",
+            "reason": "max_turns",
+            "content": notice_message,
+            "messageId": notice_id,
+            "maxTurns": max_turns,
+        })
+        emit(emitter.custom("agent:max_turns_reached", {
+            "messageId": notice_id,
+            "reason": "max_turns",
+            "message": notice_message,
+            "maxTurns": max_turns,
+        }))
+        await persist_capability_receipt("completed", reason="max_turns")
         emit(emitter.run_finished())
         tracker.finish_run(thread_id)
 
     except asyncio.CancelledError:
         logger.info("Agent loop cancelled for thread %s", thread_id)
+        await persist_capability_receipt("cancelled")
         emit(emitter.run_finished())
         tracker.finish_run(thread_id)
 
     except HookError as e:
+        await persist_capability_receipt("failed", reason="hook_error")
         emit(emitter.run_error(str(e)))
         tracker.finish_run(thread_id, "error")
 
     except Exception as e:
         logger.exception("Agent loop error")
+        await persist_capability_receipt("failed", reason="internal_error")
         emit(emitter.run_error(f"Internal error: {e}"))
         emit(emitter.run_finished())
         tracker.finish_run(thread_id, "error")
 
 
 # ── Session → LLM Message Conversion ──────────────────────────────────────
+
+
+def _stored_split_for_kept_turns(
+    stored_messages: list[dict[str, Any]],
+    kept_turns: int,
+) -> int:
+    """Locate the chronological storage boundary for retained user turns.
+
+    ``stored_messages`` must be timestamp-sorted. Only turns after the latest
+    existing compaction marker participate, matching
+    ``_stored_messages_to_llm``. The fallback keeps the final stored entry so
+    malformed/legacy histories still receive a valid divider position.
+    """
+    return _stored_compaction_span(stored_messages, kept_turns)[0]
+
+
+def _build_compaction_marker(
+    *,
+    marker_id: str,
+    summary_text: str,
+    compacted_count: int,
+    kept_count: int,
+    split_target: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build a marker that remains at its logical boundary after timestamp sort.
+
+    Session insertion assigns a current timestamp when one is absent. That would
+    move a marker inserted before retained history to the end on the next reload,
+    causing the retained messages to be treated as already summarized. Sharing
+    the split target's timestamp preserves the insertion order because Python's
+    sort is stable. An empty legacy timestamp is preserved for the same reason.
+    """
+    marker: dict[str, Any] = {
+        "role": "compaction",
+        "content": summary_text,
+        "messageId": marker_id,
+        "compactedCount": compacted_count,
+        "keptCount": kept_count,
+    }
+    if split_target is not None:
+        marker["timestamp"] = split_target.get("timestamp") or ""
+    return marker
+
+
+def _stored_compaction_span(
+    stored_messages: list[dict[str, Any]],
+    kept_turns: int,
+) -> tuple[int, int, int]:
+    """Return split index plus per-pass compacted and retained message counts.
+
+    Counts are relative to the segment after the latest existing marker. Older
+    history and prior divider records are already represented by that marker's
+    summary and must not inflate the next divider's metadata.
+    """
+    segment_start = 0
+    for idx, message in enumerate(stored_messages):
+        if message.get("role") == "compaction":
+            segment_start = idx + 1
+
+    user_indices = [
+        idx
+        for idx in range(segment_start, len(stored_messages))
+        if stored_messages[idx].get("role") == "user"
+    ]
+    if kept_turns > 0 and len(user_indices) >= kept_turns:
+        split_idx = user_indices[-kept_turns]
+    else:
+        split_idx = max(segment_start, len(stored_messages) - 1)
+    return (
+        split_idx,
+        max(0, split_idx - segment_start),
+        max(0, len(stored_messages) - split_idx),
+    )
 
 
 def _stored_messages_to_llm(stored_messages: list[dict[str, Any]]) -> list[Message]:
@@ -814,6 +1048,28 @@ def _session_messages_to_agui(raw_messages: list[dict[str, Any]]) -> list[dict[s
                 "role": "system",
                 "content": f"[COMPACTION:{count}:{kept}]\n{summary}",
             })
+        elif role == "run_notice":
+            # A max-turn notice can follow tool calls without an assistant
+            # message. Flush those calls first so replay preserves the live
+            # transcript order: tool activity, then the stop explanation.
+            if pending_tool_calls:
+                agui.append({
+                    "id": str(uuid.uuid4()),
+                    "role": "assistant",
+                    "content": "",
+                    "toolCalls": pending_tool_calls,
+                })
+                agui.extend(pending_tool_results)
+                pending_tool_calls.clear()
+                pending_tool_results.clear()
+            reason = m.get("reason", "unknown")
+            max_turns = m.get("maxTurns", 0)
+            content = m.get("content", "")
+            agui.append({
+                "id": m.get("messageId", str(uuid.uuid4())),
+                "role": "system",
+                "content": f"[RUN_NOTICE:{reason}:{max_turns}]\n{content}",
+            })
         # Skip other roles (system, etc.)
 
     # Flush any trailing tool calls (run was interrupted before assistant responded)
@@ -910,6 +1166,8 @@ async def run_agent(
 
     thread_id = req.get_thread_id()
     run_id = req.get_run_id() or str(uuid.uuid4())
+    if await sessions.get_session(thread_id) is None:
+        raise HTTPException(404, "Session not found")
 
     # Extract user query
     user_query = ""
@@ -963,11 +1221,29 @@ async def agent_status(thread_id: str) -> dict[str, Any]:
     run = get_run_tracker().get_run(thread_id)
     if run is None:
         raise HTTPException(404, "No active run")
+    if run.task is None:
+        task_status = "unknown"
+    elif run.task.cancelled():
+        task_status = "cancelled"
+    elif run.task.done():
+        task_status = "done"
+    else:
+        task_status = "running"
     return {
         "running": run.status == "running",
         "status": run.status,
         "run_id": run.run_id,
         "cursor": run.cursor,
+        "healthy": run.status == "running" and task_status == "running",
+        "task_status": task_status,
+        "started_at": run.started_at,
+        "last_event_at": run.last_event_at,
+        "last_progress_at": run.last_progress_at,
+        "last_output_at": (
+            run.active_tool.get("lastOutputAt") if run.active_tool else None
+        ),
+        "active_tool": run.active_tool,
+        "server_time": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -1202,11 +1478,50 @@ async def update_chat_session(session_id: str, req: UpdateSessionRequest) -> dic
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_chat_session(session_id: str) -> dict[str, str]:
+async def delete_chat_session(session_id: str, request: Request) -> dict[str, Any]:
+    session = await sessions.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Stop the owner task before removing files it may still be writing.
+    tracker = get_run_tracker()
+    run = tracker.get_run(session_id)
+    if run is not None and run.status == "running":
+        tracker.cancel_run(session_id)
+        if run.task is not None:
+            try:
+                await asyncio.wait_for(run.task, timeout=5)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The active run did not stop; session was not deleted",
+                ) from exc
+            except Exception:
+                # The failed/cancelled run has stopped, which is all deletion
+                # requires. Its error remains in the run tracker.
+                pass
+
+    cleanup_registry = request.app.state.session_cleanup_registry
+    try:
+        cleanup = await cleanup_registry.cleanup(session)
+    except RuntimeError as exc:
+        logger.exception("Session cleanup failed for %s", session_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Session cleanup failed; session was not deleted: {exc}",
+        ) from exc
+
     deleted = await sessions.delete_session(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"status": "deleted"}
+    tracker.remove_run(session_id)
+    return {
+        "status": "deleted",
+        "session_id": session_id,
+        "cleanup": cleanup,
+    }
 
 
 class IncomingMessage(BaseModel):
@@ -1230,7 +1545,9 @@ async def receive_message(session_id: str, msg: IncomingMessage) -> dict[str, An
     message_id = msg.messageId or f"msg-{uuid.uuid4()}"
 
     existing = await sessions.get_session(session_id)
-    if existing and any(m.get("messageId") == message_id for m in existing.get("messages", [])):
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if any(m.get("messageId") == message_id for m in existing.get("messages", [])):
         return {"ok": True, "duplicate": True}
 
     record: dict[str, Any]
@@ -1264,14 +1581,20 @@ async def receive_message(session_id: str, msg: IncomingMessage) -> dict[str, An
             record["finishedAt"] = msg.finishedAt
         await sessions.append_message(session_id, record)
 
-        await _append_visual_artifacts(
-            session_id,
-            _extract_visual_artifacts(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                tool_input=parsed_args if isinstance(parsed_args, dict) else {},
-                result=parsed_result,
-            ),
+        visual_artifacts = _extract_visual_artifacts(
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=parsed_args if isinstance(parsed_args, dict) else {},
+            result=parsed_result,
+        )
+        await _append_visual_artifacts(session_id, visual_artifacts)
+        await _record_external_capability_output(
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=parsed_result,
+            status=record["status"],
+            visual_artifacts=visual_artifacts,
         )
         _emit_external_tool_call(session_id, record)
     else:
@@ -1292,6 +1615,45 @@ def _json_text(value: Any) -> str:
 
 def _normalize_openclaw_tool_name(tool_name: str) -> str:
     return tool_name.removeprefix("dataclaw_")
+
+
+async def _record_external_capability_output(
+    *,
+    session_id: str,
+    tool_name: str,
+    tool_call_id: str,
+    result: Any,
+    status: str,
+    visual_artifacts: list[dict[str, Any]],
+) -> None:
+    """Attach callback-delivered tool use to the active run receipt."""
+    session = await sessions.get_session(session_id)
+    receipts = (session or {}).get("capabilityReceipts") or []
+    run = get_run_tracker().get_run(session_id)
+    run_id = run.run_id if run is not None else None
+    receipt = next(
+        (
+            item
+            for item in reversed(receipts)
+            if isinstance(item, dict)
+            and (
+                (run_id is not None and item.get("runId") == run_id)
+                or (run_id is None and item.get("status") == "running")
+            )
+        ),
+        None,
+    )
+    if not isinstance(receipt, dict):
+        return
+    record_tool_execution(
+        receipt,
+        tool_name=tool_name,
+        call_id=tool_call_id,
+        result=result,
+        status=status,
+        visual_artifacts=visual_artifacts,
+    )
+    await sessions.upsert_capability_receipt(session_id, receipt)
 
 
 def _emit_external_tool_call(session_id: str, record: dict[str, Any]) -> None:

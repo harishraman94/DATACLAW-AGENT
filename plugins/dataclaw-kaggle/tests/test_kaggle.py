@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import json
+import os
+import threading
 import zipfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
+import dataclaw_kaggle as kaggle_plugin
 from dataclaw_kaggle import registry, tools
-from dataclaw_kaggle.client import get_config
+from dataclaw_kaggle import client as kaggle_client
+from dataclaw_kaggle.client import get_auth_config, get_config
 
 
 # ── Registry tests ──────────────────────────────────────────────────────────
@@ -141,6 +144,369 @@ def test_get_config_none_values():
     u, k = get_config({"kaggle_username": None, "kaggle_key": None})
     assert u == ""
     assert k == ""
+
+
+def test_get_auth_config_modern_token():
+    auth = get_auth_config({"kaggle_api_token": "KGAT_modern"})
+    assert auth == {
+        "username": "",
+        "key": "",
+        "api_token": "KGAT_modern",
+    }
+
+
+def test_get_auth_config_legacy_credentials():
+    auth = get_auth_config({
+        "kaggle_username": "legacy-user",
+        "kaggle_key": "legacy-key",
+    })
+    assert auth == {
+        "username": "legacy-user",
+        "key": "legacy-key",
+        "api_token": "",
+    }
+
+
+def test_get_auth_config_migrates_kgat_saved_as_legacy_key():
+    auth = get_auth_config({
+        "kaggle_username": "ignored-for-token-auth",
+        "kaggle_key": "KGAT_existing-config",
+    })
+    assert auth == {
+        "username": "ignored-for-token-auth",
+        "key": "",
+        "api_token": "KGAT_existing-config",
+    }
+
+
+def test_modern_token_is_scoped_to_client_creation(monkeypatch):
+    kaggle_client.reset_api()
+    monkeypatch.setenv("KAGGLE_USERNAME", "host-user")
+    monkeypatch.setenv("KAGGLE_KEY", "host-key")
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+    observed = {}
+
+    class FakeApi:
+        CONFIG_NAME_USER = "username"
+        CONFIG_NAME_KEY = "key"
+        CONFIG_NAME_TOKEN = "token"
+        CONFIG_NAME_AUTH_METHOD = "auth_method"
+
+        def __init__(self):
+            observed.update({
+                name: os.environ.get(name)
+                for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN")
+            })
+            self.config_values = {}
+
+    monkeypatch.setattr(kaggle_client, "_kaggle_api_cls", FakeApi)
+
+    result = kaggle_client._get_api(
+        username="configured-user",
+        key="KGAT_configured-token",
+    )
+
+    assert observed == {
+        "KAGGLE_USERNAME": "host-user",
+        "KAGGLE_KEY": "host-key",
+        "KAGGLE_API_TOKEN": None,
+    }
+    assert result.config_values == {
+        "token": "KGAT_configured-token",
+        "username": "configured-user",
+        "auth_method": "ACCESS_TOKEN",
+    }
+    assert os.environ["KAGGLE_USERNAME"] == "host-user"
+    assert os.environ["KAGGLE_KEY"] == "host-key"
+    assert "KAGGLE_API_TOKEN" not in os.environ
+    kaggle_client.reset_api()
+
+
+def test_legacy_credentials_override_ambient_token_during_creation(monkeypatch):
+    kaggle_client.reset_api()
+    monkeypatch.setenv("KAGGLE_USERNAME", "host-user")
+    monkeypatch.setenv("KAGGLE_KEY", "host-key")
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "host-token")
+    observed = {}
+
+    class FakeApi:
+        CONFIG_NAME_USER = "username"
+        CONFIG_NAME_KEY = "key"
+        CONFIG_NAME_TOKEN = "token"
+        CONFIG_NAME_AUTH_METHOD = "auth_method"
+
+        def __init__(self):
+            observed.update({
+                name: os.environ.get(name)
+                for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN")
+            })
+            self.config_values = {}
+
+    monkeypatch.setattr(kaggle_client, "_kaggle_api_cls", FakeApi)
+
+    result = kaggle_client._get_api(username="legacy-user", key="legacy-key")
+
+    assert observed == {
+        "KAGGLE_USERNAME": "host-user",
+        "KAGGLE_KEY": "host-key",
+        "KAGGLE_API_TOKEN": "host-token",
+    }
+    assert result.config_values == {
+        "username": "legacy-user",
+        "key": "legacy-key",
+        "auth_method": "LEGACY_API_KEY",
+    }
+    assert os.environ["KAGGLE_USERNAME"] == "host-user"
+    assert os.environ["KAGGLE_KEY"] == "host-key"
+    assert os.environ["KAGGLE_API_TOKEN"] == "host-token"
+    kaggle_client.reset_api()
+
+
+def test_client_cache_refreshes_when_credentials_change(monkeypatch):
+    kaggle_client.reset_api()
+    created = []
+
+    def fake_create_api(username, key, api_token):
+        api = object()
+        created.append((api, username, key, api_token))
+        return api
+
+    monkeypatch.setattr(kaggle_client, "_create_authenticated_api", fake_create_api)
+
+    first = kaggle_client._get_api(api_token="KGAT_one")
+    cached = kaggle_client._get_api(api_token="KGAT_one")
+    second = kaggle_client._get_api(api_token="KGAT_two")
+
+    assert cached is first
+    assert second is not first
+    assert len(created) == 2
+    assert created[0][3] == "KGAT_one"
+    assert created[1][3] == "KGAT_two"
+    kaggle_client.reset_api()
+
+
+def test_authentication_exit_becomes_runtime_error():
+    class ExitingApi:
+        def authenticate(self):
+            raise SystemExit(1)
+
+    with pytest.raises(RuntimeError, match="authentication is not configured"):
+        kaggle_client._authenticate_api(ExitingApi())
+
+
+def test_import_time_exit_becomes_runtime_error(monkeypatch):
+    monkeypatch.setattr(kaggle_client, "_kaggle_api_cls", None)
+
+    def exiting_import():
+        raise SystemExit(1)
+
+    monkeypatch.setattr(kaggle_client, "_import_kaggle_api_class", exiting_import)
+
+    with pytest.raises(RuntimeError, match="initialize the Kaggle SDK"):
+        kaggle_client._load_kaggle_api_class()
+
+
+def test_safe_sdk_import_restores_host_environment(monkeypatch):
+    monkeypatch.setattr(kaggle_client, "_kaggle_api_cls", None)
+    monkeypatch.setenv("KAGGLE_USERNAME", "host-user")
+    monkeypatch.setenv("KAGGLE_KEY", "host-key")
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "host-token")
+    observed = {}
+    fake_class = object()
+
+    def fake_import():
+        observed.update({
+            name: os.environ.get(name)
+            for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_API_TOKEN")
+        })
+        return fake_class
+
+    monkeypatch.setattr(kaggle_client, "_import_kaggle_api_class", fake_import)
+
+    assert kaggle_client._load_kaggle_api_class() is fake_class
+    assert observed == {
+        "KAGGLE_USERNAME": "__dataclaw_import__",
+        "KAGGLE_KEY": "__dataclaw_import__",
+        "KAGGLE_API_TOKEN": None,
+    }
+    assert os.environ["KAGGLE_USERNAME"] == "host-user"
+    assert os.environ["KAGGLE_KEY"] == "host-key"
+    assert os.environ["KAGGLE_API_TOKEN"] == "host-token"
+
+
+def test_plugin_token_never_enters_process_environment(monkeypatch):
+    kaggle_client.reset_api()
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowFakeApi:
+        CONFIG_NAME_USER = "username"
+        CONFIG_NAME_KEY = "key"
+        CONFIG_NAME_TOKEN = "token"
+        CONFIG_NAME_AUTH_METHOD = "auth_method"
+
+        def __init__(self):
+            self.config_values = {}
+            started.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(kaggle_client, "_kaggle_api_cls", SlowFakeApi)
+    worker = threading.Thread(
+        target=lambda: kaggle_client._get_api(api_token="KGAT_review_sentinel")
+    )
+    worker.start()
+    assert started.wait(5)
+    assert os.environ.get("KAGGLE_API_TOKEN") != "KGAT_review_sentinel"
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    kaggle_client.reset_api()
+
+
+@pytest.mark.asyncio
+async def test_run_kaggle_authenticates_and_calls_sdk_off_event_loop(monkeypatch):
+    main_thread = threading.get_ident()
+    observed_threads = []
+
+    class FakeApi:
+        def competitions_list(self, **kwargs):
+            observed_threads.append(threading.get_ident())
+            return kwargs["page"]
+
+    def fake_get_api(username, key, api_token):
+        observed_threads.append(threading.get_ident())
+        assert api_token == "KGAT_worker"
+        return FakeApi()
+
+    monkeypatch.setattr(kaggle_client, "_get_api", fake_get_api)
+
+    result = await kaggle_client.run_kaggle(
+        "competitions_list",
+        page=2,
+        api_token="KGAT_worker",
+    )
+
+    assert result == 2
+    assert observed_threads
+    assert all(thread_id != main_thread for thread_id in observed_threads)
+
+
+def test_plugin_config_update_refreshes_modules_and_client(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        kaggle_plugin,
+        "set_plugin_cfg",
+        lambda cfg: observed.__setitem__("tools", cfg),
+    )
+    monkeypatch.setattr(
+        kaggle_plugin,
+        "set_router_cfg",
+        lambda cfg: observed.__setitem__("router", cfg),
+    )
+    monkeypatch.setattr(
+        kaggle_plugin,
+        "reset_api",
+        lambda: observed.__setitem__("reset", True),
+    )
+    monkeypatch.setattr(
+        kaggle_plugin,
+        "prepare_client",
+        lambda: observed.__setitem__("prepared", True),
+    )
+    config = SimpleNamespace(plugins={"kaggle": {"kaggle_api_token": "KGAT_new"}})
+
+    kaggle_plugin.KagglePlugin().on_config_update(config)
+
+    assert observed == {
+        "tools": {"kaggle_api_token": "KGAT_new"},
+        "router": {"kaggle_api_token": "KGAT_new"},
+        "reset": True,
+        "prepared": True,
+    }
+
+
+def test_unconfigured_plugin_does_not_eagerly_import_sdk(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(kaggle_plugin, "set_plugin_cfg", lambda cfg: None)
+    monkeypatch.setattr(kaggle_plugin, "set_router_cfg", lambda cfg: None)
+    monkeypatch.setattr(kaggle_plugin, "reset_api", lambda: None)
+    monkeypatch.setattr(
+        kaggle_plugin,
+        "prepare_client",
+        lambda: observed.__setitem__("prepared", True),
+    )
+
+    kaggle_plugin.KagglePlugin()._apply_config(
+        SimpleNamespace(plugins={"kaggle": {}})
+    )
+
+    assert observed == {}
+
+
+@pytest.mark.asyncio
+async def test_download_hook_injects_trusted_session_context():
+    state = {
+        "session_id": "actual-session",
+        "pending_tool_calls": [
+            {
+                "tool_name": "kaggle_download_competition",
+                "tool_input": {
+                    "competition": "titanic",
+                    "session_id": "spoofed-session",
+                },
+            },
+            {
+                "tool_name": "kaggle_download_dataset",
+                "tool_input": {
+                    "dataset": "owner/data",
+                    "dataclaw_session_id": "spoofed-session",
+                },
+            },
+            {
+                "tool_name": "kaggle_list_competitions",
+                "tool_input": {"search": "housing"},
+            },
+        ],
+    }
+
+    updated = await kaggle_plugin.inject_kaggle_session_context(state)
+
+    competition_input = updated["pending_tool_calls"][0]["tool_input"]
+    assert "session_id" not in competition_input
+    assert competition_input["dataclaw_session_id"] == "actual-session"
+    assert updated["pending_tool_calls"][1]["tool_input"]["dataclaw_session_id"] == (
+        "actual-session"
+    )
+    assert updated["pending_tool_calls"][2]["tool_input"] == {"search": "housing"}
+
+
+def test_kaggle_secret_fields_use_password_inputs():
+    fields = {
+        field.name: field.field_type
+        for field in kaggle_plugin.KagglePlugin().ui_manifest().config_fields
+    }
+    assert fields["kaggle_api_token"] == "secret"
+    assert fields["kaggle_key"] == "secret"
+
+
+def test_relative_download_root_is_anchored_to_plugin_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "plugin_data_dir",
+        lambda plugin_name: tmp_path / "plugins" / plugin_name,
+    )
+    monkeypatch.setattr(tools, "_plugin_cfg", {"download_dir": "downloads"})
+
+    assert tools._download_root() == (
+        tmp_path / "plugins" / "kaggle" / "downloads"
+    ).resolve()
+
+
+def test_competition_slug_cannot_escape_download_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "_download_root", lambda: tmp_path)
+
+    with pytest.raises(ValueError, match="Invalid Kaggle competition slug"):
+        tools._competition_dir("../../outside")
 
 
 # ── Zip extraction tests ───────────────────────────────────────────────────
@@ -326,23 +692,70 @@ async def test_already_downloaded_self_heals_zip(
         key="titanic",
         download_path=str(dest),
         files=["titanic.zip"],
+        dataclaw_dataset_id="dataset-titanic",
     )
     _drop_zip_into(dest, "titanic.zip", {"train.csv": b"hi", "test.csv": b"bye"})
+    enabled = []
 
     # run_kaggle must not be called on the already-downloaded path.
     async def boom(*args, **kwargs):
         raise AssertionError("run_kaggle should not be invoked when already downloaded")
 
-    monkeypatch.setattr(tools, "run_kaggle", boom)
+    async def capture_enable(dataset_id, session_id):
+        enabled.append((dataset_id, session_id))
 
-    result = await tools.kaggle_download_competition("titanic")
+    monkeypatch.setattr(tools, "run_kaggle", boom)
+    monkeypatch.setattr(tools, "_enable_dataset_for_session", capture_enable)
+
+    result = await tools.kaggle_download_competition(
+        "titanic",
+        dataclaw_session_id="session-1",
+    )
 
     assert result["status"] == "already_downloaded"
     assert set(result["files"]) == {"train.csv", "test.csv"}
+    assert result["dataclaw_dataset_id"] == "dataset-titanic"
+    assert enabled == [("dataset-titanic", "session-1")]
     assert not (dest / "titanic.zip").exists()
     # Registry was refreshed.
     persisted = registry.get_competition("titanic")
     assert set(persisted["files"]) == {"train.csv", "test.csv"}
+
+
+@pytest.mark.asyncio
+async def test_cached_dataset_is_enabled_for_calling_session(
+    kaggle_download_root, monkeypatch
+):
+    dest = kaggle_download_root / "datasets" / "owner_data"
+    dest.mkdir(parents=True)
+    (dest / "data.csv").write_text("value\n1\n")
+    registry.track_dataset("owner/data", {"title": "Owner data"})
+    registry.record_download(
+        kind="datasets",
+        key="owner/data",
+        download_path=str(dest),
+        files=["data.csv"],
+        dataclaw_dataset_id="dataset-owner-data",
+    )
+    enabled = []
+
+    async def boom(*args, **kwargs):
+        raise AssertionError("run_kaggle should not be invoked when already downloaded")
+
+    async def capture_enable(dataset_id, session_id):
+        enabled.append((dataset_id, session_id))
+
+    monkeypatch.setattr(tools, "run_kaggle", boom)
+    monkeypatch.setattr(tools, "_enable_dataset_for_session", capture_enable)
+
+    result = await tools.kaggle_download_dataset(
+        "owner/data",
+        dataclaw_session_id="session-2",
+    )
+
+    assert result["status"] == "already_downloaded"
+    assert result["dataclaw_dataset_id"] == "dataset-owner-data"
+    assert enabled == [("dataset-owner-data", "session-2")]
 
 
 # ── Stale-cache recovery tests ─────────────────────────────────────────────
@@ -452,3 +865,99 @@ async def test_download_dataset_redownloads_when_path_deleted(
 
     assert result["status"] == "downloaded"
     assert result["files"] == ["iris.csv"]
+
+
+@pytest.mark.asyncio
+async def test_forced_download_reuses_existing_dataclaw_dataset_id(
+    kaggle_download_root,
+    monkeypatch,
+):
+    dest = kaggle_download_root / "competitions" / "titanic"
+    dest.mkdir(parents=True)
+    (dest / "old.csv").write_text("value\n1\n")
+    registry.track_competition("titanic", {"title": "Titanic"})
+    registry.record_download(
+        kind="competitions",
+        key="titanic",
+        download_path=str(dest),
+        files=["old.csv"],
+        dataclaw_dataset_id="stable-id",
+    )
+    observed_existing_ids = []
+
+    async def fake_run_kaggle(method, *args, **kwargs):
+        Path(kwargs["path"]).mkdir(parents=True, exist_ok=True)
+        (Path(kwargs["path"]) / "new.csv").write_text("value\n2\n")
+
+    def fake_register(**kwargs):
+        observed_existing_ids.append(kwargs["existing_dataset_id"])
+        return kwargs["existing_dataset_id"]
+
+    monkeypatch.setattr(tools, "run_kaggle", fake_run_kaggle)
+    monkeypatch.setattr(tools, "_register_as_dataclaw_dataset", fake_register)
+
+    result = await tools.kaggle_download_competition("titanic", force=True)
+
+    assert result["dataclaw_dataset_id"] == "stable-id"
+    assert result["dataset_registration"] == "registered"
+    assert observed_existing_ids == ["stable-id"]
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_is_returned_and_logged(
+    kaggle_download_root,
+    monkeypatch,
+    caplog,
+):
+    async def fake_run_kaggle(method, *args, **kwargs):
+        Path(kwargs["path"]).mkdir(parents=True, exist_ok=True)
+        (Path(kwargs["path"]) / "data.csv").write_text("value\n1\n")
+
+    def fail_registration(**kwargs):
+        raise RuntimeError("registry unavailable")
+
+    monkeypatch.setattr(tools, "run_kaggle", fake_run_kaggle)
+    monkeypatch.setattr(tools, "_register_as_dataclaw_dataset", fail_registration)
+
+    with caplog.at_level("ERROR"):
+        result = await tools.kaggle_download_dataset("owner/data")
+
+    assert result["status"] == "downloaded"
+    assert result["dataset_registration"] == "failed"
+    assert result["dataset_registration_error"] == "registry unavailable"
+    assert any("Failed to register Kaggle download" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_session_attachment_failure_is_returned_and_logged(
+    kaggle_download_root,
+    monkeypatch,
+    caplog,
+):
+    dest = kaggle_download_root / "datasets" / "owner_data"
+    dest.mkdir(parents=True)
+    (dest / "data.csv").write_text("value\n1\n")
+    registry.track_dataset("owner/data", {"title": "Owner data"})
+    registry.record_download(
+        kind="datasets",
+        key="owner/data",
+        download_path=str(dest),
+        files=["data.csv"],
+        dataclaw_dataset_id="dataset-id",
+    )
+
+    async def fail_attachment(dataset_id, session_id):
+        raise RuntimeError("session storage unavailable")
+
+    monkeypatch.setattr(tools, "_enable_dataset_for_session", fail_attachment)
+
+    with caplog.at_level("ERROR"):
+        result = await tools.kaggle_download_dataset(
+            "owner/data",
+            dataclaw_session_id="session-id",
+        )
+
+    assert result["status"] == "already_downloaded"
+    assert result["session_attachment"] == "failed"
+    assert result["session_attachment_error"] == "session storage unavailable"
+    assert any("Failed to enable dataset" in record.message for record in caplog.records)

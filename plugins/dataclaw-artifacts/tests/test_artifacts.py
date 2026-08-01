@@ -15,13 +15,16 @@ from dataclaw_artifacts.sections import (
     CHART_SUMMARY_MAX_BYTES,
     SectionValidationError,
     normalize_section,
+    prepare_advanced_visual_data,
     section_attrs,
     section_meta_script,
 )
 from dataclaw_artifacts.store import (
     MAX_EXPORTED_ARTIFACT_BYTES,
     MAX_PUBLISHED_ARTIFACT_BYTES,
+    artifacts_root,
     ensure_living_report,
+    living_report_id,
     read_manifest_events,
     read_meta,
     read_source,
@@ -205,8 +208,8 @@ async def test_publish_revise_read_and_conflict_by_source_path():
         await export_artifact(artifact_id=created["artifact_id"], version=2, session_id="other-session")
 
     listed = await list_artifacts(session_id=session_id)
-    assert listed["total"] == 2
-    assert listed["artifacts"][0]["kind"] == "living_report"
+    assert listed["total"] == 1
+    assert listed["artifacts"][0]["kind"] == "artifact"
     published = next(artifact for artifact in listed["artifacts"] if artifact["artifact_id"] == created["artifact_id"])
     assert published["latest_version"] == 2
 
@@ -628,6 +631,121 @@ def test_typed_sections_are_stable_and_validated():
     assert cards["kind"] == "entity_card_grid"
     assert cards["payload"]["item_count"] == 1
 
+    advanced = normalize_section("handcrafted_visual", {
+        "title": "Probability movement",
+        "caption": "Before and after probabilities from the validated aggregate output.",
+        "records": [
+            {"team": "A", "before": 18.2, "after": 23.4},
+            {"team": "B", "before": 20.1, "after": 17.8},
+        ],
+        "visual": {"type": "slopegraph", "label": "team", "start": "before", "end": "after"},
+        "interpretation": "Team A gained while Team B declined in the supplied update.",
+        "evidence": [{"kind": "notebook_cell", "ref": "cell-movement"}],
+    })
+    assert advanced["kind"] == "advanced_visual"
+    assert advanced["data_policy"] == "aggregate_only"
+    assert advanced["payload"]["visual_type"] == "slopegraph"
+    assert advanced["payload"]["record_count"] == 2
+    assert advanced["payload"]["field_mappings"] == {
+        "label": "team", "start": "before", "end": "after",
+    }
+    assert advanced["payload"]["evidence_count"] == 1
+
+
+def test_advanced_visual_requires_governed_shape_and_local_interpretation():
+    base = {
+        "records": [{"label": "A", "value": 1}],
+        "visual": {"type": "dot_plot", "label": "label", "value": "value"},
+        "caption": "Validated aggregate values.",
+        "interpretation": "A is the supplied leading value.",
+    }
+
+    with pytest.raises(SectionValidationError) as exc:
+        normalize_section("advanced_visual", {**base, "visual": {"type": "radial_magic", "label": "label", "value": "value"}})
+    assert exc.value.code == "unsupported_advanced_visual_type"
+
+    with pytest.raises(SectionValidationError) as exc:
+        normalize_section("advanced_visual", {**base, "interpretation": ""})
+    assert exc.value.code == "advanced_visual_missing_interpretation"
+
+
+@pytest.mark.parametrize(("visual", "records"), [
+    ({"type": "dot_plot", "label": "name", "value": "score"}, [{"name": "A", "score": 2}]),
+    ({"type": "lollipop", "label": "name", "value": "score"}, [{"name": "A", "score": "2.5"}]),
+    ({"type": "slopegraph", "label": "name", "start": "before", "end": "after"}, [{"name": "A", "before": 1, "after": 2}]),
+    ({"type": "range_band", "label": "name", "low": "low", "high": "high", "value": "mid"}, [{"name": "A", "low": 1, "high": 3, "mid": 2}]),
+    ({"type": "matrix", "x": "column", "y": "row", "value": "score"}, [{"column": "A", "row": "B", "score": 2}]),
+    ({"type": "timeline", "label": "event", "time": "when", "detail": "note", "scale": "time"}, [{"event": "A", "when": "2026-07-18", "note": "Validated"}]),
+    ({"type": "flow", "source": "from", "target": "to", "value": "count"}, [{"from": "A", "to": "B", "count": 2}]),
+    ({"type": "bracket", "source": "from", "target": "to", "stages": ["Round 1", "Final"]}, [{"from": "A", "to": "B"}]),
+])
+def test_all_advanced_visual_types_validate_and_project_only_mapped_fields(visual, records):
+    records = [{**record, "private_email": "secret@example.com", "raw_payload": {"hidden": True}} for record in records]
+    projected, normalized_visual, summary = prepare_advanced_visual_data({"records": records, "visual": visual})
+
+    assert normalized_visual["type"] == visual["type"]
+    assert "private_email" not in projected[0]
+    assert "raw_payload" not in projected[0]
+    assert summary["data_minimized"] is True
+    assert summary["discarded_column_count"] == 2
+
+
+@pytest.mark.parametrize(("data", "code"), [
+    ({
+        "records": [{"name": "A", "before": "unknown", "after": 2}],
+        "visual": {"type": "slopegraph", "label": "name", "start": "before", "end": "after"},
+    }, "advanced_visual_invalid_number"),
+    ({
+        "records": [{"name": "A", "low": 4, "high": 2}],
+        "visual": {"type": "range_band", "label": "name", "low": "low", "high": "high"},
+    }, "advanced_visual_invalid_range"),
+    ({
+        "records": [{"from": "A", "to": "B"}, {"from": "B", "to": "A"}],
+        "visual": {"type": "flow", "source": "from", "target": "to"},
+    }, "advanced_visual_cyclic_flow"),
+    ({
+        "records": [{"event": "A", "when": "sometime"}],
+        "visual": {"type": "timeline", "label": "event", "time": "when", "scale": "time"},
+    }, "advanced_visual_invalid_time"),
+    ({
+        "records": [{"x": "A", "y": "B", "value": 1}, {"x": "A", "y": "B", "value": 2}],
+        "visual": {"type": "matrix", "x": "x", "y": "y", "value": "value"},
+    }, "advanced_visual_duplicate_record"),
+])
+def test_advanced_visual_semantic_validation_rejects_misleading_inputs(data, code):
+    with pytest.raises(SectionValidationError) as exc:
+        prepare_advanced_visual_data(data)
+    assert exc.value.code == code
+
+
+def test_advanced_visual_cannot_override_aggregate_only_policy():
+    with pytest.raises(SectionValidationError) as exc:
+        normalize_section("advanced_visual", {
+            "data_policy": "preview",
+            "records": [{"label": "A", "value": 1}],
+            "visual": {"type": "dot_plot", "label": "label", "value": "value"},
+            "caption": "Aggregate values.",
+            "interpretation": "A has the supplied value.",
+        })
+    assert exc.value.code == "advanced_visual_requires_aggregate_only"
+
+
+def test_unmapped_advanced_fields_do_not_change_artifact_identity():
+    base = {
+        "records": [{"label": "A", "value": 1, "private": "first"}],
+        "visual": {"type": "dot_plot", "label": "label", "value": "value"},
+        "caption": "Aggregate values.",
+        "interpretation": "A has the supplied value.",
+    }
+    changed_hidden_field = {
+        **base,
+        "records": [{"label": "A", "value": 1, "private": "second"}],
+    }
+
+    assert normalize_section("advanced_visual", base)["section_id"] == normalize_section(
+        "advanced_visual", changed_hidden_field,
+    )["section_id"]
+
 
 def test_typed_sections_reject_oversize_chart_summary():
     too_large = {"figure": {"data": [{"x": ["x" * CHART_SUMMARY_MAX_BYTES]}]}}
@@ -699,13 +817,11 @@ async def test_report_note_creates_live_report_and_compiles_pages():
 
 
 @pytest.mark.asyncio
-async def test_list_artifacts_creates_empty_living_report():
+async def test_list_artifacts_is_read_only_for_empty_session():
     listed = await list_artifacts(session_id="session-empty")
 
-    assert listed["total"] == 1
-    assert listed["artifacts"][0]["kind"] == "living_report"
-    assert listed["artifacts"][0]["url"].endswith("/living?session_id=session-empty")
-    assert read_manifest_events(listed["artifacts"][0]["artifact_id"]) == []
+    assert listed == {"artifacts": [], "total": 0}
+    assert not (artifacts_root() / living_report_id("session-empty")).exists()
 
 
 @pytest.mark.asyncio

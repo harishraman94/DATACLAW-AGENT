@@ -13,7 +13,6 @@ from dataclaw_artifacts.store import (
     append_living_report_event,
     delete_artifact_record,
     ensure_artifact_session,
-    ensure_living_report,
     artifact_export_url,
     artifact_url,
     living_report_url,
@@ -227,8 +226,6 @@ async def list_artifacts(
     limit: int = 100,
     **_: Any,
 ) -> dict[str, Any]:
-    if session_id:
-        ensure_living_report(session_id, project_id, touch=False)
     artifacts = []
     for meta in list_artifact_records(session_id=session_id, limit=limit):
         latest = int(meta.get("latest_version") or 0)

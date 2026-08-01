@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Button, Empty, Input, Modal, Popconfirm, Tag, Tooltip, message } from 'antd'
 import { PlusOutlined, UploadOutlined, EditOutlined, DeleteOutlined, DownloadOutlined,
-         CheckCircleOutlined, AppstoreOutlined, FolderOpenOutlined,
+         CheckCircleOutlined, AppstoreOutlined, FolderOpenOutlined, CopyOutlined,
          BoldOutlined, ItalicOutlined, OrderedListOutlined, UnorderedListOutlined } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -15,6 +15,7 @@ interface Skill {
   tags?: string[]
   body?: string
   source?: string
+  library_id?: string
 }
 
 interface LibrarySkill {
@@ -213,6 +214,7 @@ export default function SkillsPage() {
 
   // Edit modal
   const [editing, setEditing] = useState<Skill | null>(null)
+  const [editMode, setEditMode] = useState<'new' | 'edit' | 'duplicate'>('new')
   const [modalOpen, setModalOpen] = useState(false)
 
   // Install in-flight
@@ -262,6 +264,7 @@ export default function SkillsPage() {
   }, [])
 
   const openNew = () => {
+    setEditMode('new')
     setEditing({ id: '', name: '', description: '', body: '' })
     setModalOpen(true)
   }
@@ -270,10 +273,44 @@ export default function SkillsPage() {
     try {
       const res = await fetch(`${API}/skills/${id}`)
       if (res.ok) {
-        setEditing(await res.json())
+        const skill = await res.json()
+        if (
+          skill.source === 'library'
+          || skill.library_id
+          || librarySkills.some(item => item.id === skill.id)
+        ) {
+          message.warning('Library skills are read-only. Duplicate this skill to customize it.')
+          return
+        }
+        setEditMode('edit')
+        setEditing(skill)
         setModalOpen(true)
       }
     } catch {}
+  }
+
+  const duplicateAsCustom = (skill: Skill) => {
+    const baseName = `${skill.name || skill.id} Copy`
+    const occupiedIds = new Set([
+      ...skills.map(item => item.id),
+      ...librarySkills.map(item => item.id),
+    ])
+    let name = baseName
+    let suffix = 2
+    while (occupiedIds.has(slugify(name))) {
+      name = `${baseName} ${suffix}`
+      suffix += 1
+    }
+
+    setEditMode('duplicate')
+    setEditing({
+      id: '',
+      name,
+      description: skill.description || '',
+      tags: skill.tags || [],
+      body: skill.body || '',
+    })
+    setModalOpen(true)
   }
 
   function handleUpload() {
@@ -304,6 +341,7 @@ export default function SkillsPage() {
         }
       }
 
+      setEditMode('new')
       setEditing({ id: '', name, description, body })
       setModalOpen(true)
     }
@@ -312,7 +350,7 @@ export default function SkillsPage() {
 
   const save = async () => {
     if (!editing) return
-    const isNew = !editing.id || !skills.some(s => s.id === editing.id)
+    const isNew = editMode !== 'edit'
     const skillId = editing.id || slugify(editing.name || 'skill')
 
     const method = isNew ? 'POST' : 'PUT'
@@ -328,7 +366,11 @@ export default function SkillsPage() {
         }),
       })
       if (res.ok) {
-        message.success(isNew ? 'Skill created' : 'Skill updated')
+        message.success(
+          editMode === 'duplicate'
+            ? 'Custom copy created'
+            : isNew ? 'Skill created' : 'Skill updated',
+        )
         setModalOpen(false)
         await loadSkills()
         selectSkill({ kind: 'my', id: skillId })
@@ -337,27 +379,32 @@ export default function SkillsPage() {
           setSyncModalOpen(true)
         }
       } else {
-        message.error('Failed to save skill')
+        const err = await res.json().catch(() => ({ detail: 'Failed to save skill' }))
+        message.error(err.detail || 'Failed to save skill')
       }
     } catch {
       message.error('Failed to save skill')
     }
   }
 
-  const deleteSkill = async (id: string) => {
+  const removeSkill = async (id: string, librarySkill: boolean) => {
     try {
       const res = await fetch(`${API}/skills/${id}`, { method: 'DELETE' })
       if (res.ok) {
-        message.success('Skill deleted')
+        message.success(librarySkill ? 'Skill uninstalled' : 'Custom skill deleted')
         if (selection?.kind === 'my' && selection.id === id) selectSkill(null)
-        loadSkills()
-        loadLibrarySkills()
+        await Promise.all([loadSkills(), loadLibrarySkills()])
         if (openclawEnabled) {
           setPendingSyncId(id)
           setSyncDeleteModalOpen(true)
         }
+      } else {
+        const err = await res.json().catch(() => ({ detail: 'Failed to remove skill' }))
+        message.error(err.detail || 'Failed to remove skill')
       }
-    } catch {}
+    } catch {
+      message.error('Failed to remove skill')
+    }
   }
 
   const installLibrarySkill = async (skillId: string) => {
@@ -367,8 +414,7 @@ export default function SkillsPage() {
       if (res.ok) {
         message.success('Skill installed')
         await Promise.all([loadSkills(), loadLibrarySkills()])
-        // Refresh the detail so the Install button flips to Installed
-        if (selection?.kind === 'library' && selection.id === skillId) selectSkill(selection)
+        selectSkill({ kind: 'my', id: skillId })
         if (openclawEnabled) {
           setPendingSyncId(skillId)
           setSyncModalOpen(true)
@@ -421,10 +467,15 @@ export default function SkillsPage() {
     }
   }
 
-  const isEditingExisting = !!(editing?.id && skills.some(s => s.id === editing.id))
+  const isEditingExisting = editMode === 'edit'
 
   // Library skills that are not yet installed (installed ones live under My Skills)
   const availableLibrary = librarySkills.filter(s => !s.installed)
+  const detailIsLibrary = !!detail && (
+    detail.source === 'library'
+    || !!detail.library_id
+    || librarySkills.some(skill => skill.id === detail.id)
+  )
 
   return (
     <div style={{ display: 'flex', height: '100%', minHeight: 0 }}>
@@ -530,7 +581,7 @@ export default function SkillsPage() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                   <h1 style={{ margin: 0, fontSize: 22, fontWeight: 600 }}>{detail.name || detail.id}</h1>
                   {selection.kind === 'my' && (
-                    detail.source === 'library'
+                    detailIsLibrary
                       ? <Tag color="blue">From Library</Tag>
                       : <Tag color="geekblue">Custom</Tag>
                   )}
@@ -546,22 +597,52 @@ export default function SkillsPage() {
               {/* Actions */}
               <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
                 {selection.kind === 'my' ? (
+                  detailIsLibrary ? (
+                    <>
+                      <Button icon={<CopyOutlined />} onClick={() => duplicateAsCustom(detail)}>
+                        Duplicate as custom
+                      </Button>
+                      <Popconfirm
+                        title="Uninstall this skill?"
+                        description="The bundled library skill will remain available to install again."
+                        okText="Uninstall"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => removeSkill(detail.id, true)}
+                      >
+                        <Button icon={<DeleteOutlined />} danger>Uninstall</Button>
+                      </Popconfirm>
+                    </>
+                  ) : (
+                    <>
+                      <Button icon={<EditOutlined />} onClick={() => openEdit(detail.id)}>Edit</Button>
+                      <Popconfirm
+                        title="Delete this custom skill?"
+                        description="This permanently deletes the custom skill file."
+                        okText="Delete"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => removeSkill(detail.id, false)}
+                      >
+                        <Button icon={<DeleteOutlined />} danger>Delete</Button>
+                      </Popconfirm>
+                    </>
+                  )
+                ) : (
                   <>
-                    <Button icon={<EditOutlined />} onClick={() => openEdit(detail.id)}>Edit</Button>
-                    <Popconfirm title="Delete this skill?" onConfirm={() => deleteSkill(detail.id)}>
-                      <Button icon={<DeleteOutlined />} danger />
-                    </Popconfirm>
+                    <Button icon={<CopyOutlined />} onClick={() => duplicateAsCustom(detail)}>
+                      Duplicate as custom
+                    </Button>
+                    {!detail.installed && (
+                      <Button
+                        type="primary"
+                        icon={<DownloadOutlined />}
+                        loading={installing === detail.id}
+                        onClick={() => installLibrarySkill(detail.id)}
+                      >
+                        Install
+                      </Button>
+                    )}
                   </>
-                ) : !detail.installed ? (
-                  <Button
-                    type="primary"
-                    icon={<DownloadOutlined />}
-                    loading={installing === detail.id}
-                    onClick={() => installLibrarySkill(detail.id)}
-                  >
-                    Install
-                  </Button>
-                ) : null}
+                )}
               </div>
             </div>
 
@@ -586,7 +667,11 @@ export default function SkillsPage() {
       {/* Edit / New modal                                                   */}
       {/* ------------------------------------------------------------------ */}
       <Modal
-        title={isEditingExisting ? 'Edit Skill' : 'New Skill'}
+        title={
+          isEditingExisting
+            ? 'Edit Skill'
+            : editMode === 'duplicate' ? 'Duplicate as Custom Skill' : 'New Skill'
+        }
         open={modalOpen}
         onCancel={() => setModalOpen(false)}
         onOk={save}

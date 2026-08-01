@@ -378,6 +378,70 @@ def test_resolve_python_keeps_venv_symlink(tmp_path):
     assert resolved == link, f"symlink was dereferenced to {resolved}"
 
 
+def test_existing_managed_venv_upgrades_incompatible_mlflow(tmp_path, monkeypatch):
+    mgr = NotebookManager(
+        notebooks_dir=tmp_path / "notebooks",
+        venvs_dir=tmp_path / "venvs",
+        project_id="managed",
+    )
+    python = mgr._venv_python()
+    python.parent.mkdir(parents=True)
+    python.touch()
+
+    versions = iter(["3.11.1", "3.14.0"])
+    monkeypatch.setattr(
+        mgr,
+        "_installed_mlflow_version",
+        lambda _python: next(versions),
+    )
+    monkeypatch.setattr(mgr, "_uv_command", lambda: ["uv"])
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return None
+
+    monkeypatch.setattr("dataclaw_notebooks.manager.subprocess.run", fake_run)
+
+    resolved = mgr._ensure_venv()
+
+    assert resolved == python
+    assert len(calls) == 1
+    assert calls[0][0] == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        str(python),
+        "mlflow==3.14.0",
+    ]
+    assert calls[0][1]["check"] is True
+
+
+def test_existing_managed_venv_keeps_compatible_mlflow(tmp_path, monkeypatch):
+    mgr = NotebookManager(
+        notebooks_dir=tmp_path / "notebooks",
+        venvs_dir=tmp_path / "venvs",
+        project_id="managed",
+    )
+    python = mgr._venv_python()
+    python.parent.mkdir(parents=True)
+    python.touch()
+
+    monkeypatch.setattr(
+        mgr,
+        "_installed_mlflow_version",
+        lambda _python: "3.14.0",
+    )
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("compatible managed venv should not be modified")
+
+    monkeypatch.setattr("dataclaw_notebooks.manager.subprocess.run", unexpected_run)
+
+    assert mgr._ensure_venv() == python
+
+
 # ── Event-loop regression tests ───────────────────────────────────────────
 
 

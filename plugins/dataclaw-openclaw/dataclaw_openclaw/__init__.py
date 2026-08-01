@@ -34,6 +34,14 @@ class OpenClawPlugin:
         ctx.include_api_router(install_router, prefix="/openclaw", tags=["openclaw-install"])
         ctx.include_api_router(skill_sync_router, prefix="/openclaw", tags=["openclaw-skills"])
         ctx.include_api_router(tool_proxy_router, tags=["openclaw-tools"])
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_openclaw.bridge import destroy_bridge
+
+            def _cleanup_bridge(session):
+                destroy_bridge(str(session.get("id") or ""))
+                return {"removed": True}
+
+            ctx.session_cleanup_registry.register("openclaw_bridge", _cleanup_bridge)
         logger.info("OpenClaw plugin: install + skill sync + tool proxy routers registered")
 
         cfg = ctx.config.plugins.get("openclaw", {})

@@ -3,6 +3,7 @@
 import pytest
 
 import dataclaw.config.paths as paths
+from dataclaw.mlflow_compat import MLFLOW_VERSION
 from dataclaw_plans.store import (
     read_proposals,
     write_proposals,
@@ -12,14 +13,54 @@ from dataclaw_plans.store import (
     SNAPSHOTS_PER_PROPOSAL,
 )
 from dataclaw_plans.tools import propose_plan, update_plan, get_plan_decision, list_plans, get_plan
-from dataclaw_plans.hooks import active_plan_context_hook
+from dataclaw_plans.hooks import active_plan_context_hook, planning_reasoning_hook
 from dataclaw_plans.gates import accept_gate_risk, get_plan_gates, set_step_gate
+from dataclaw_plans.mlflow_tools import (
+    _client,
+    delete_session_experiment,
+    get_or_create_experiment,
+    query_mlflow_runs,
+)
 
 
 @pytest.fixture(autouse=True)
 def tmp_home(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "DATACLAW_HOME", tmp_path)
     return tmp_path
+
+
+# ── MLflow compatibility ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_mlflow_round_trip_matches_runtime_contract():
+    import mlflow
+
+    assert mlflow.__version__ == MLFLOW_VERSION
+
+    session_id = "mlflow-round-trip"
+    experiment_id = get_or_create_experiment(session_id)
+    client = _client()
+    run = client.create_run(
+        experiment_id,
+        tags={"mlflow.runName": "compatibility-smoke"},
+    )
+    client.log_param(run.info.run_id, "alpha", "0.1")
+    client.log_metric(run.info.run_id, "score", 0.9)
+    client.set_terminated(run.info.run_id)
+
+    result = await query_mlflow_runs(session_id=session_id)
+
+    assert "error" not in result
+    assert result["experiment_id"] == experiment_id
+    assert len(result["runs"]) == 1
+    assert result["runs"][0]["params"]["alpha"] == "0.1"
+    assert result["runs"][0]["metrics"]["score"] == 0.9
+
+    cleanup = delete_session_experiment(session_id)
+    assert cleanup["removed"] is True
+    assert cleanup["permanent"] is True
+    assert _client().get_experiment_by_name(f"dataclaw-{session_id}") is None
 
 
 # ── Propose ─────────────────────────────────────────────────────────────────
@@ -639,6 +680,48 @@ async def test_hook_injects_session_id():
     }
     updated = await active_plan_context_hook(state)
     assert updated["pending_tool_calls"][0]["tool_input"]["session_id"] == "real-sess"
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_elevates_while_drafting_then_stops():
+    """Reasoning is elevated through the planning/approval phase, off during execution."""
+    sid = "sess-1"
+    state = {"session_id": sid}
+
+    # Pre-plan (EDA + drafting turn): elevated.
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "high"
+
+    # Drafted but awaiting approval (covers revisions): still elevated.
+    r = await propose_plan(
+        name="P", description="d", steps=[{"name": "s", "description": "d"}],
+        plan_markdown="# Plan\n\n## QA\nCheck counts.", session_id=sid,
+    )
+    assert (await planning_reasoning_hook(dict(state)))["reasoning_effort"] == "high"
+
+    # Approved → execution phase → not elevated.
+    await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
+    assert "reasoning_effort" not in await planning_reasoning_hook(dict(state))
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_ignores_missing_session():
+    assert (await planning_reasoning_hook({"session_id": ""})).get("reasoning_effort", "") == ""
+
+
+@pytest.mark.asyncio
+async def test_planning_reasoning_hook_clears_stale_effort_after_mid_run_approval():
+    """Auto-mode approves mid-run: a value set on the drafting turn must be cleared,
+    not carried onto execution turns within the same graph run."""
+    sid = "sess-1"
+    r = await propose_plan(
+        name="P", description="d", steps=[{"name": "s", "description": "d"}],
+        plan_markdown="# Plan\n\n## QA\nCheck counts.", session_id=sid,
+    )
+    await update_plan(proposal_id=r["proposal_id"], status="approved", session_id=sid)
+
+    # State still carries the elevated effort from the earlier drafting turn.
+    out = await planning_reasoning_hook({"session_id": sid, "reasoning_effort": "high"})
+    assert out["reasoning_effort"] == ""
 
 
 @pytest.mark.asyncio

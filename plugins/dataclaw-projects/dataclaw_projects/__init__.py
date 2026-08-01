@@ -46,6 +46,15 @@ class ProjectsPlugin:
                 return state
             if session_data:
                 set_allowed_subagent_ids(session_data.get("subagentIds"))
+                updated_calls = []
+                for tool_call in state.get("pending_tool_calls", []):
+                    if tool_call.get("tool_name") != "delegate_to_subagent":
+                        updated_calls.append(tool_call)
+                        continue
+                    tool_input = dict(tool_call.get("tool_input") or {})
+                    tool_input["dataclaw_session_id"] = session_id
+                    updated_calls.append({**tool_call, "tool_input": tool_input})
+                state = {**state, "pending_tool_calls": updated_calls}
             else:
                 set_allowed_subagent_ids(None)
             return state

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from typing import Any
 
 from dataclaw.config.paths import plugin_data_dir
+from dataclaw.mlflow_compat import MLFLOW_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -14,14 +16,22 @@ _TRACKING_URI: str | None = None
 
 def _get_tracking_uri() -> str:
     global _TRACKING_URI
-    if _TRACKING_URI is None:
-        db_path = plugin_data_dir("plans") / "mlflow.db"
-        _TRACKING_URI = f"sqlite:///{db_path}"
+    db_path = plugin_data_dir("plans") / "mlflow.db"
+    expected = f"sqlite:///{db_path}"
+    if _TRACKING_URI != expected:
+        _TRACKING_URI = expected
     return _TRACKING_URI
 
 
 def _client():
     import mlflow
+
+    if mlflow.__version__ != MLFLOW_VERSION:
+        raise RuntimeError(
+            "DataClaw's MLflow runtime is inconsistent: "
+            f"expected {MLFLOW_VERSION}, found {mlflow.__version__}. "
+            "Synchronize the locked environment before using experiment tracking."
+        )
     mlflow.set_tracking_uri(_get_tracking_uri())
     return mlflow.tracking.MlflowClient(_get_tracking_uri())
 
@@ -35,6 +45,69 @@ def get_or_create_experiment(session_id: str) -> str:
         return exp.experiment_id
     artifacts_dir = str(plugin_data_dir("plans") / "mlflow_artifacts")
     return client.create_experiment(exp_name, artifact_location=artifacts_dir)
+
+
+def delete_session_experiment(session_id: str) -> dict[str, Any]:
+    """Delete a session's MLflow runs/artifacts and retire its experiment."""
+    if not session_id:
+        return {"removed": False}
+    try:
+        client = _client()
+        experiment = client.get_experiment_by_name(f"dataclaw-{session_id}")
+        if experiment is None:
+            return {"removed": False}
+
+        run_ids: list[str] = []
+        try:
+            from mlflow.entities import ViewType
+
+            runs = client.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                max_results=100_000,
+                run_view_type=ViewType.ALL,
+            )
+            run_ids = [str(run.info.run_id) for run in runs]
+        except Exception:
+            logger.debug("Could not enumerate MLflow runs during cleanup", exc_info=True)
+
+        client.delete_experiment(experiment.experiment_id)
+
+        # MlflowClient deletion is recoverable (lifecycle_stage=deleted).
+        # Session deletion is explicitly permanent, so run MLflow's own GC
+        # implementation for this exact experiment to remove its metadata and
+        # artifacts rather than leaving a restorable hidden record.
+        from mlflow.cli import _gc_tracking_resources, _get_store
+
+        backend_store = _get_store(_get_tracking_uri(), None)
+        if not hasattr(backend_store, "_hard_delete_experiment"):
+            raise RuntimeError("MLflow backend does not support permanent experiment deletion")
+        _gc_tracking_resources(
+            backend_store=backend_store,
+            run_ids=None,
+            experiment_ids=[str(experiment.experiment_id)],
+            logged_model_ids=None,
+            older_than=None,
+            time_delta=0,
+            skip_experiments=False,
+            skip_logged_models=True,
+        )
+
+        artifacts_root = plugin_data_dir("plans") / "mlflow_artifacts"
+        for run_id in run_ids:
+            run_dir = artifacts_root / run_id
+            if run_dir.parent == artifacts_root and run_dir.exists():
+                shutil.rmtree(run_dir)
+        return {
+            "removed": True,
+            "experiment_id": experiment.experiment_id,
+            "removed_run_artifacts": len(run_ids),
+            "permanent": True,
+        }
+    except Exception:
+        # MLflow is optional. If it is installed and has a matching experiment,
+        # failures must abort session deletion rather than leave hidden state.
+        logger.exception("Failed to delete MLflow experiment for %s", session_id)
+        raise
 
 
 def _serialize(val: Any) -> Any:

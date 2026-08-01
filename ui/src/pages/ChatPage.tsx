@@ -5,12 +5,12 @@ import {
   FolderOutlined, FolderOpenOutlined, ExperimentOutlined, StopOutlined, ReloadOutlined,
   EditOutlined, SafetyOutlined,
   ExportOutlined, PauseOutlined, PlayCircleOutlined, CloseOutlined, ArrowUpOutlined, RightOutlined,
-  ArrowLeftOutlined, DeleteOutlined, MessageOutlined, FileTextOutlined, DatabaseOutlined,
+  ArrowLeftOutlined, DeleteOutlined, MessageOutlined, FileTextOutlined, DatabaseOutlined, LoadingOutlined,
 } from '@ant-design/icons'
 import { useSearchParams } from 'react-router-dom'
 import { API } from '../api'
 import { useAGUI } from '../hooks/useAGUI'
-import type { AGUIMessage, ToolCallState } from '../hooks/useAGUI'
+import type { AGUIMessage, RunHealth, ToolCallState } from '../hooks/useAGUI'
 import MarkdownContent from '../components/MarkdownContent'
 import { groupTranscript, TurnActivity } from '../components/ChatActivity'
 import { toolBaseName } from '../components/reportPublishState'
@@ -32,7 +32,34 @@ interface QueuedMessage { id: string; text: string; ts: number }
 interface PersistedToolTiming { startedAt?: number; finishedAt?: number }
 interface ReportCounts { published: number; scratch: number }
 interface DatasetConfirmation { sessionId?: string; pendingMessage?: string; title?: string }
+interface CapabilityIdentity {
+  id?: string
+  serialId?: string
+  name?: string
+  source?: string
+  origin?: string
+  sha256?: string
+  callId?: string
+  status?: string
+}
+interface CapabilityReceipt {
+  runId: string
+  startedAt?: string
+  finishedAt?: string
+  status?: string
+  reason?: string
+  skills?: { offered?: CapabilityIdentity[]; used?: CapabilityIdentity[] }
+  tools?: { offered?: CapabilityIdentity[]; used?: CapabilityIdentity[] }
+  outputs?: Array<{ toolCallId?: string; toolName?: string; messageId?: string; status?: string; references?: Record<string, unknown>; visualArtifacts?: Array<Record<string, unknown>> }>
+}
+interface ResumeOpportunity {
+  reason: 'max_turns' | 'stopped' | 'error' | 'compaction' | 'incomplete'
+  title: string
+  description: string
+}
 type FileSort = 'name' | 'size' | 'modified' | 'type'
+
+const RESUME_WORK_MESSAGE = 'Continue from where you stopped. Review the saved progress and complete the remaining work.'
 
 function isSuccessfulArtifactPublish(call: ToolCallState): boolean {
   if (toolBaseName(call.name) !== 'publish_artifact' || call.status !== 'complete' || !call.result) return false
@@ -42,6 +69,43 @@ function isSuccessfulArtifactPublish(call: ToolCallState): boolean {
   } catch {
     return false
   }
+}
+
+function describeRunStatus(
+  activeTool: ToolCallState | null,
+  health: RunHealth | null,
+  state: { isStopping: boolean; reconnecting: boolean },
+) {
+  if (state.isStopping) return 'Stopping the current run…'
+  if (state.reconnecting) return 'Reconnecting to the current run…'
+  if (health && !health.reachable) return 'Run status is temporarily unavailable — reconnecting…'
+  if (health && !health.healthy && health.task_status !== 'unknown') {
+    return `Run needs attention — task is ${health.task_status}`
+  }
+  if (!activeTool) {
+    const backendLabel = health?.active_tool?.label
+    return typeof backendLabel === 'string' && backendLabel
+      ? backendLabel
+      : 'Dataclaw is preparing the next step…'
+  }
+
+  const progress = activeTool.progress
+  const label = progress?.label || (toolBaseName(activeTool.name) === 'report_design_report'
+    ? 'Designing the report'
+    : `Running ${activeTool.name.replace(/_/g, ' ')}`)
+  const details: string[] = []
+  if (progress?.activity === 'receiving') details.push('receiving output')
+  else if (progress?.activity === 'waiting') details.push('waiting for model')
+  if (typeof progress?.elapsedMs === 'number') details.push(formatElapsed(progress.elapsedMs))
+  if (progress?.timeoutSeconds && progress.timeoutSeconds >= 60) {
+    details.push(`up to ${Math.round(progress.timeoutSeconds / 60)}m for this pass`)
+  }
+  return `${label}${details.length ? ` · ${details.join(' · ')}` : ''}`
+}
+
+function formatElapsed(milliseconds: number) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 }
 
 // A chat is a reading surface, not an edge-to-edge document.  The outer
@@ -82,6 +146,89 @@ function persistedToolTimings(messages: unknown): Record<string, PersistedToolTi
   return timings
 }
 
+function findResumeOpportunity({
+  messages,
+  toolCalls,
+  error,
+  manuallyStopped,
+  isRunning,
+  hasPendingPlan,
+  hasQueuedMessages,
+}: {
+  messages: AGUIMessage[]
+  toolCalls: ToolCallState[]
+  error: string | null
+  manuallyStopped: boolean
+  isRunning: boolean
+  hasPendingPlan: boolean
+  hasQueuedMessages: boolean
+}): ResumeOpportunity | null {
+  if (isRunning || hasPendingPlan || hasQueuedMessages) return null
+  if (manuallyStopped) {
+    return {
+      reason: 'stopped',
+      title: 'Run stopped before completion',
+      description: 'Progress is saved and Dataclaw can continue from the latest checkpoint.',
+    }
+  }
+  if (error) {
+    return {
+      reason: 'error',
+      title: 'Run needs another attempt',
+      description: 'Resume with the saved conversation and completed tool results.',
+    }
+  }
+
+  const completedAssistantOrder = messages.reduce(
+    (latest, message) => message.role === 'assistant' && message.content.trim()
+      ? Math.max(latest, message.order)
+      : latest,
+    0,
+  )
+  const latestWorkOrder = Math.max(
+    0,
+    ...messages.filter(message => message.role === 'user').map(message => message.order),
+    ...toolCalls.map(call => call.order),
+  )
+  const latestNotice = messages
+    .filter(message => message.role === 'run_notice')
+    .sort((left, right) => right.order - left.order)[0]
+  if (latestNotice && latestNotice.order >= Math.max(completedAssistantOrder, latestWorkOrder)) {
+    const maxTurns = latestNotice.maxTurns ? ` after ${latestNotice.maxTurns} turns` : ''
+    return latestNotice.stopReason === 'max_turns'
+      ? {
+          reason: 'max_turns',
+          title: `Action-round limit reached${maxTurns}`,
+          description: 'Progress is saved and the remaining work can continue in a new run.',
+        }
+      : {
+          reason: latestNotice.stopReason === 'error' ? 'error' : 'stopped',
+          title: 'Run stopped before completion',
+          description: 'Progress is saved and Dataclaw can continue from the latest checkpoint.',
+        }
+  }
+
+  const latestCompactionOrder = messages.reduce(
+    (latest, message) => message.role === 'compaction' ? Math.max(latest, message.order) : latest,
+    0,
+  )
+  if (latestCompactionOrder > completedAssistantOrder && latestWorkOrder > completedAssistantOrder) {
+    return {
+      reason: 'compaction',
+      title: 'Compacted conversation has unfinished work',
+      description: 'The context summary is saved, but no completed response followed it.',
+    }
+  }
+  if (latestWorkOrder > completedAssistantOrder) {
+    return {
+      reason: 'incomplete',
+      title: 'Latest request has no completed response',
+      description: 'Continue from the saved messages and completed tool results.',
+    }
+  }
+  return null
+}
+
 interface ChatPageProps {
   projectId?: string
   initialSessionId?: string | null
@@ -101,10 +248,14 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [sessionProjectId, setSessionProjectId] = useState<string | null>(projectId ?? null)
   const [loadedSessionTitle, setLoadedSessionTitle] = useState('')
   const [savedToolTimings, setSavedToolTimings] = useState<Record<string, PersistedToolTiming>>({})
+  const [manualResumePending, setManualResumePending] = useState(false)
   const effectiveProjectId = projectId || sessionProjectId
   const [projectName, setProjectName] = useState<string | null>(null)
   const setActiveSessionId = (id: string | null) => {
-    if (id !== activeSessionId) setLoadedSessionTitle('')
+    if (id !== activeSessionId) {
+      setLoadedSessionTitle('')
+      setManualResumePending(false)
+    }
     _setActiveSessionId(id)
     if (id) setSessionBrowserOpen(false)
     if (!id) setSessionProjectId(projectId ?? null)
@@ -153,6 +304,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const pendingPlanDecisionRef = useRef<{ sessionId: string; text: string } | null>(null)
   const queuedMessagesRef = useRef<QueuedMessage[]>([])
   const queuePausedRef = useRef(false)
+  const sendNextAfterStopRef = useRef(false)
   const datasetConfirmationOpenRef = useRef(false)
   const commitQueueRef = useRef<(messages: QueuedMessage[], paused: boolean) => void>(() => {})
   const dispatchQueuedMessageRef = useRef<() => boolean>(() => false)
@@ -187,6 +339,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [allSkills, setAllSkills] = useState<any[]>([])
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[] | null>(null)
   const [skillModalOpen, setSkillModalOpen] = useState(false)
+  const refreshedSkillCallIdsRef = useRef<Set<string>>(new Set())
 
   // Subagent filters
   const [allSubagents, setAllSubagents] = useState<any[]>([])
@@ -197,6 +350,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [allGuardrails, setAllGuardrails] = useState<any[]>([])
   const [guardrailDisabled, setGuardrailDisabled] = useState<string[]>([])
   const [guardrailModalOpen, setGuardrailModalOpen] = useState(false)
+  const [capabilityReceipts, setCapabilityReceipts] = useState<CapabilityReceipt[]>([])
 
   // Update dataset filter and persist to session
   const updateDatasetFilter = useCallback((ids: string[] | null) => {
@@ -261,6 +415,15 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
       }).catch(() => {})
     }
   }, [activeSessionId])
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const response = await fetch(`${API}/skills`)
+      if (!response.ok) return
+      const skills = await response.json()
+      setAllSkills(Array.isArray(skills) ? skills : [])
+    } catch {}
+  }, [])
 
   const updateSubagentFilter = useCallback((ids: string[] | null) => {
     setSelectedSubagentIds(ids)
@@ -370,6 +533,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     const [next, ...rest] = queuedMessagesRef.current
     if (!sessionId || !next || queuePausedRef.current) return false
     commitQueue(rest, false)
+    setManualResumePending(false)
     setTimeout(() => sendMessageRef.current(sessionId, [], next.text, { sentFromQueue: true, queuedAt: next.ts }), 0)
     return true
   }, [commitQueue])
@@ -394,13 +558,34 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
       // Re-check auto mode — user may have toggled it off during the delay
       if (!sessionId || !autoModeRef.current) return
       setAutoTurnsUsed(prev => prev + 1)
+      setManualResumePending(false)
       // We pass empty history — the backend loads full history from session storage
       sendMessageRef.current(sessionId, [], autoMessageRef.current)
     }, 2000)
   }, [])
 
-  const { messages, toolCalls, timeline, isRunning, reconnecting, error, sendMessage, cancelRun, checkAndReconnect, reset, setToolCalls } = useAGUI({ onRunFinished })
+  const { messages, toolCalls, timeline, isRunning, isStopping, reconnecting, runHealth, error, sendMessage, cancelRun, checkAndReconnect, reset, setToolCalls } = useAGUI({ onRunFinished })
   sendMessageRef.current = sendMessage
+
+  // Skill-library freshness can change while the UI is open (for example after
+  // a bundled plugin update). Recheck at the session boundary and after the
+  // agent actually loads a skill instead of running a noisy timer.
+  useEffect(() => {
+    refreshedSkillCallIdsRef.current.clear()
+    void refreshSkills()
+  }, [activeSessionId, refreshSkills])
+  useEffect(() => {
+    const newlyCompleted = toolCalls.some(call => {
+      if (
+        toolBaseName(call.name) !== 'fetch_skill'
+        || call.status === 'calling'
+        || refreshedSkillCallIdsRef.current.has(call.id)
+      ) return false
+      refreshedSkillCallIdsRef.current.add(call.id)
+      return true
+    })
+    if (newlyCompleted) void refreshSkills()
+  }, [toolCalls, refreshSkills])
 
   const deleteSession = useCallback(async (sessionId: string) => {
     const response = await fetch(`${API}/chat/sessions/${sessionId}`, { method: 'DELETE' })
@@ -519,6 +704,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     }
 
     const history = messages.map(m => ({ role: m.role, content: m.content }))
+    setManualResumePending(false)
     sendMessage(activeSessionId, history, text)
   }, [isRunning, activeSessionId, messages, sendMessage])
 
@@ -527,6 +713,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     const pending = pendingPlanDecisionRef.current
     if (!pending) return
     pendingPlanDecisionRef.current = null
+    setManualResumePending(false)
     sendMessage(pending.sessionId, [], pending.text)
   }, [isRunning, sendMessage])
 
@@ -593,6 +780,20 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const pendingPlans = useMemo(() => plans.filter(p => p.status === 'pending'), [plans])
   const latestPendingPlan = pendingPlans[pendingPlans.length - 1] ?? null
+  const resumeOpportunity = useMemo(() => findResumeOpportunity({
+    messages,
+    toolCalls,
+    error,
+    manuallyStopped: manualResumePending,
+    isRunning,
+    hasPendingPlan: Boolean(latestPendingPlan),
+    hasQueuedMessages: queuedMessages.length > 0,
+  }), [error, isRunning, latestPendingPlan, manualResumePending, messages, queuedMessages.length, toolCalls])
+  const resumeWork = useCallback(() => {
+    if (!activeSessionId || isRunning) return
+    setManualResumePending(false)
+    sendMessage(activeSessionId, [], RESUME_WORK_MESSAGE)
+  }, [activeSessionId, isRunning, sendMessage])
 
   // A newly submitted plan should be reviewable beside the conversation
   // without asking the user to discover the collapsed rail first. Remember
@@ -630,6 +831,8 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
         : null
   const composerPlaceholder = latestPendingPlan
     ? 'Type feedback or revision notes for this plan...'
+    : isStopping
+      ? 'Stopping the current run...'
     : isRunning
       ? 'Message Dataclaw — sends when the current run finishes...'
       : 'Send a message...'
@@ -748,6 +951,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
         if (session?.subagentIds !== undefined) setSelectedSubagentIds(session.subagentIds)
         if (session?.guardrailConfig?.disabled) setGuardrailDisabled(session.guardrailConfig.disabled)
         else setGuardrailDisabled([])
+        setCapabilityReceipts(Array.isArray(session?.capabilityReceipts) ? session.capabilityReceipts : [])
         const restoredQueue = Array.isArray(session?.queuedMessages) ? session.queuedMessages : []
         queuedMessagesRef.current = restoredQueue
         queuePausedRef.current = Boolean(session?.queuePaused)
@@ -766,6 +970,16 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     // Load messages via MessagesSnapshot (handles both history and active run reconnection)
     checkAndReconnect(activeSessionId)
   }, [activeSessionId, reset, checkAndReconnect])
+  useEffect(() => {
+    if (!activeSessionId || isRunning) return
+    fetch(`${API}/chat/sessions/${activeSessionId}`)
+      .then(response => response.ok ? response.json() : null)
+      .then(session => {
+        if (activeSessionIdRef.current !== activeSessionId) return
+        setCapabilityReceipts(Array.isArray(session?.capabilityReceipts) ? session.capabilityReceipts : [])
+      })
+      .catch(() => {})
+  }, [activeSessionId, isRunning])
 
   // Load datasets for filter
   useEffect(() => {
@@ -776,10 +990,12 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   // Load tools, skills, subagents for filters
   useEffect(() => {
     fetch(`${API}/tools`).then(r => r.ok ? r.json() : { tools: [] }).then(d => setAllTools(d.tools ?? [])).catch(() => {})
-    fetch(`${API}/skills`).then(r => r.ok ? r.json() : []).then(setAllSkills).catch(() => {})
     fetch(`${API}/subagents/`).then(r => r.ok ? r.json() : []).then(setAllSubagents).catch(() => {})
     fetch(`${API}/guardrails`).then(r => r.ok ? r.json() : { guardrails: [] }).then(d => setAllGuardrails(d.guardrails ?? [])).catch(() => {})
   }, [])
+  useEffect(() => {
+    if (sidebarTab === 'scope') void refreshSkills()
+  }, [sidebarTab, refreshSkills])
 
   // Load project files for explorer
   const loadProjectFiles = useCallback(() => {
@@ -870,6 +1086,18 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const hasMore = filteredTimeline.length > visibleCount
   const windowedBlocks = useMemo(() => groupTranscript(windowedTimeline), [windowedTimeline])
+  const activeToolCall = useMemo(
+    () => [...toolCalls].reverse().find(call => call.status === 'calling') || null,
+    [toolCalls],
+  )
+  const liveRunStatus = describeRunStatus(activeToolCall, runHealth, { isStopping, reconnecting })
+
+  useEffect(() => {
+    if (isRunning || !sendNextAfterStopRef.current) return
+    sendNextAfterStopRef.current = false
+    commitQueue(queuedMessagesRef.current, false)
+    dispatchQueuedMessageRef.current()
+  }, [commitQueue, isRunning])
 
   // Reset visible window when switching sessions
   useEffect(() => { setVisibleCount(WINDOW_SIZE) }, [activeSessionId])
@@ -990,6 +1218,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
     const history = messages.map(m => ({ role: m.role, content: m.content }))
     if (queuePausedRef.current) commitQueue(queuedMessagesRef.current, false)
+    setManualResumePending(false)
     sendMessage(sessionId!, history, text)
   }
 
@@ -1238,6 +1467,8 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                     ? <TurnActivity group={block.group} onFileClick={previewFile} sessionId={activeSessionId} />
                     : (block.entry.item as AGUIMessage).role === 'compaction'
                     ? <CompactionDivider message={block.entry.item as AGUIMessage} />
+                    : (block.entry.item as AGUIMessage).role === 'run_notice'
+                    ? <RunNotice message={block.entry.item as AGUIMessage} />
                     : <MessageBubble message={block.entry.item as AGUIMessage} onFileClick={previewFile} />
                   }
                 </div>
@@ -1269,7 +1500,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                       }} />
                     ))}
                   </div>
-                  <span style={{ fontSize: 12, color: '#999' }}>{reconnecting ? 'Reconnecting...' : 'Dataclaw is thinking...'}</span>
+                  <span style={{ fontSize: 12, color: '#667085' }}>{liveRunStatus}</span>
                 </div>
               )}
               <div ref={messagesEndRef} />
@@ -1289,6 +1520,17 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
               <Button size="small" danger onClick={() => submitDecision(latestPendingPlan.id, 'denied')}>Deny</Button>
             </div>
           )}
+          {resumeOpportunity && (
+            <div
+              data-testid="resume-work-banner"
+              style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto 8px', padding: '8px 10px', border: '1px solid #b2ccff', borderRadius: 8, background: '#f5f8ff', color: '#344054', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }}
+              role="status"
+            >
+              <PlayCircleOutlined aria-hidden="true" style={{ color: 'var(--accent)' }} />
+              <span><b>{resumeOpportunity.title}.</b> {resumeOpportunity.description}</span>
+              <Button type="primary" size="small" icon={<PlayCircleOutlined />} onClick={resumeWork} style={{ marginLeft: 'auto', flex: '0 0 auto' }}>Resume work</Button>
+            </div>
+          )}
           {queuePaused && queuedMessages.length > 0 && (
             <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto 8px', padding: '8px 10px', border: '1px solid #d0d5dd', borderRadius: 8, background: '#f7f8fa', color: '#475467', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }} role="status">
               <PauseOutlined aria-hidden="true" />
@@ -1305,7 +1547,8 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
               style={{ borderRadius: 10 }} />
             {isRunning ? (
               <>
-                <Button danger icon={<StopOutlined />} onClick={() => {
+                <Button danger disabled={isStopping} icon={isStopping ? <LoadingOutlined spin /> : <StopOutlined />} onClick={() => {
+                  setManualResumePending(true)
                   if (activeSessionId) cancelRun(activeSessionId)
                   if (queuedMessagesRef.current.length > 0) commitQueue(queuedMessagesRef.current, true)
                   if (autoMode) {
@@ -1318,15 +1561,22 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                     }
                   }
                 }}
-                  style={{ borderRadius: 10, height: 36 }}>Stop</Button>
-                <Button type="primary" onClick={handleSend} style={{ borderRadius: 10, height: 36 }}>Queue ↵</Button>
+                  style={{ borderRadius: 10, height: 36 }}>{isStopping ? 'Stopping…' : 'Stop'}</Button>
+                {queuedMessages.length > 0 && !isStopping && (
+                  <Button onClick={() => {
+                    sendNextAfterStopRef.current = true
+                    commitQueue(queuedMessagesRef.current, true)
+                    if (activeSessionId) cancelRun(activeSessionId)
+                  }} style={{ borderRadius: 10, height: 36 }}>Stop &amp; send next</Button>
+                )}
+                <Button type="primary" disabled={isStopping} onClick={handleSend} style={{ borderRadius: 10, height: 36 }}>Queue ↵</Button>
               </>
             ) : (
               <Button type="primary" icon={<SendOutlined />} onClick={handleSend}
                 style={{ borderRadius: 10, minWidth: 44, height: 32 }} />
             )}
           </div>
-          {isRunning && <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '6px auto 0', color: 'var(--faint)', fontSize: 11, textAlign: 'right' }}>↵ send — queues during a run · ⇧↵ newline</div>}
+          {isRunning && <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '6px auto 0', color: 'var(--faint)', fontSize: 11, textAlign: 'right' }}>{queuedMessages.length > 0 ? `${queuedMessages.length} message${queuedMessages.length === 1 ? '' : 's'} queued · ` : ''}↵ send — queues during a run · ⇧↵ newline</div>}
         </div>}
       </div>
 
@@ -1473,6 +1723,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                 skills={allSkills} selectedSkillIds={selectedSkillIds} onSkillChange={updateSkillFilter}
                 subagents={allSubagents} selectedSubagentIds={selectedSubagentIds} onSubagentChange={updateSubagentFilter}
                 guardrails={allGuardrails} disabledGuardrailIds={guardrailDisabled} onGuardrailChange={updateGuardrailConfig}
+                receipts={capabilityReceipts}
               />
             )}
           </div>
@@ -1778,7 +2029,7 @@ function SessionBrowser({ sessions, onOpen, onCreate, onDelete }: {
               <span title={session.title || 'Untitled chat'} style={{ flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13, fontWeight: 600 }}>{conciseTitle(session.title || 'Untitled chat', 56)}</span>
               <span style={{ flex: '0 0 auto', color: 'var(--faint)', fontSize: 11 }}>{formatSessionDate(session.createdAt)}</span>
               <div onClick={event => event.stopPropagation()}>
-                <Popconfirm title="Delete this chat?" description="This cannot be undone." okText="Delete" okButtonProps={{ danger: true }} onConfirm={() => onDelete(session.id)}>
+                <Popconfirm title="Delete this chat and its workspace?" description="Permanently deletes this chat, its DataClaw workspace, artifacts, plans, and analysis records. Shared project files and datasets are kept." okText="Delete all" okButtonProps={{ danger: true }} onConfirm={() => onDelete(session.id)}>
                   <Button type="text" size="small" danger icon={<DeleteOutlined />} aria-label={`Delete ${session.title || 'chat'}`} />
                 </Popconfirm>
               </div>
@@ -1860,12 +2111,14 @@ function ScopePanel({
   skills, selectedSkillIds, onSkillChange,
   subagents, selectedSubagentIds, onSubagentChange,
   guardrails, disabledGuardrailIds, onGuardrailChange,
+  receipts,
 }: {
   projectName: string | null
   tools: any[]; selectedToolIds: string[] | null; onToolChange: (ids: string[] | null) => void
   skills: any[]; selectedSkillIds: string[] | null; onSkillChange: (ids: string[] | null) => void
   subagents: any[]; selectedSubagentIds: string[] | null; onSubagentChange: (ids: string[] | null) => void
   guardrails: any[]; disabledGuardrailIds: string[]; onGuardrailChange: (ids: string[]) => void
+  receipts: CapabilityReceipt[]
 }) {
   return (
     <section aria-label="Session scope" style={{ color: 'var(--ink)' }}>
@@ -1873,20 +2126,130 @@ function ScopePanel({
         {projectName ? <>Project defaults · <b>{projectName}</b><br />Changes below are session-only overrides.</> : 'Independent session scope'}
       </p>
       <ScopeGroup name="Tools" items={tools} selectedIds={selectedToolIds} getId={item => item.name} getName={item => item.label || item.display_name || item.name} describe={item => item.source} onChange={onToolChange} mono />
-      <ScopeGroup name="Skills" items={skills} selectedIds={selectedSkillIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.description} onChange={onSkillChange} />
+      <ScopeGroup name="Skills" items={skills} selectedIds={selectedSkillIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.description} getWarning={staleSkillWarning} onChange={onSkillChange} />
       <ScopeGroup name="Subagents" items={subagents} selectedIds={selectedSubagentIds} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => item.agent_type} onChange={onSubagentChange} />
       <ScopeGroup name="Guardrails" items={guardrails} selectedIds={guardrails.length ? guardrails.filter(item => !disabledGuardrailIds.includes(item.id)).map(item => item.id) : null} getId={item => item.id} getName={item => item.name || item.title || item.id} describe={item => `${item.phase || 'runtime'} · ${item.mode === 'user_approval' ? 'approval' : 'auto'}`} onChange={ids => onGuardrailChange(ids === null ? [] : guardrails.map(item => item.id).filter(id => !ids.includes(id)))} />
+      <CapabilityReceipts receipts={receipts} />
     </section>
   )
 }
 
-function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChange, mono = false }: {
+function CapabilityReceipts({ receipts }: { receipts: CapabilityReceipt[] }) {
+  const recent = receipts.slice(-5).reverse()
+  return (
+    <div style={{ borderTop: '1px solid var(--line)', padding: '12px 0 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+        <SafetyOutlined style={{ color: 'var(--faint)' }} />
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Run receipts</span>
+        <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>{receipts.length}</span>
+      </div>
+      <p style={{ margin: '5px 0 9px 22px', color: 'var(--faint)', fontSize: 11.5, lineHeight: 1.4 }}>
+        Exact capabilities offered and used, persisted with each run.
+      </p>
+      {recent.length === 0 ? (
+        <div style={{ marginLeft: 22, color: 'var(--faint)', fontSize: 12 }}>No runs recorded yet.</div>
+      ) : recent.map(receipt => {
+        const offeredSkills = receipt.skills?.offered || []
+        const usedSkills = receipt.skills?.used || []
+        const offeredTools = receipt.tools?.offered || []
+        const usedTools = receipt.tools?.used || []
+        const outputs = receipt.outputs || []
+        return (
+          <details key={receipt.runId} style={{ margin: '0 0 7px 18px', border: '1px solid var(--line)', borderRadius: 7, padding: '7px 9px', background: 'var(--bg)' }}>
+            <summary style={{ cursor: 'pointer', color: 'var(--ink)', fontSize: 12 }}>
+              <span style={{ fontWeight: 600 }}>{receipt.status || 'unknown'}</span>
+              <span style={{ color: 'var(--faint)' }}> · {usedSkills.length} skills used · {usedTools.length} tool calls · {outputs.length} outputs</span>
+            </summary>
+            <div style={{ display: 'grid', gap: 8, marginTop: 8, color: 'var(--muted)', fontSize: 11.5 }}>
+              <div>
+                <b>Run</b> <code title={receipt.runId}>{receipt.runId}</code>
+                {receipt.reason ? ` · ${receipt.reason}` : ''}
+              </div>
+              <div><b>Offered</b> · {offeredSkills.length} skills · {offeredTools.length} tools</div>
+              <ReceiptIdentityList label="Skills offered" items={offeredSkills} />
+              <ReceiptIdentityList label="Tools offered" items={offeredTools} />
+              <ReceiptIdentityList label="Skills used" items={usedSkills} />
+              <ReceiptIdentityList label="Tools called" items={usedTools} />
+              {outputs.length > 0 && (
+                <div>
+                  <b>Outputs</b>
+                  {outputs.map((output, index) => (
+                    <div key={`${output.toolCallId || output.messageId || index}`} style={{ marginTop: 3, overflowWrap: 'anywhere' }}>
+                      <code>{output.messageId || output.toolCallId || 'output'}</code> · {output.toolName || 'tool'} · {output.status || 'unknown'}
+                      {output.references && Object.keys(output.references).length > 0
+                        ? ` · ${Object.entries(output.references).map(([key, value]) => `${key}=${String(value)}`).join(', ')}`
+                        : ''}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </details>
+        )
+      })}
+    </div>
+  )
+}
+
+function ReceiptIdentityList({ label, items }: { label: string; items: CapabilityIdentity[] }) {
+  if (items.length === 0) return <div><b>{label}</b> · none</div>
+  return (
+    <div>
+      <b>{label}</b>
+      {items.map((item, index) => (
+        <div key={`${item.callId || item.id || item.name || index}`} style={{ marginTop: 3, overflowWrap: 'anywhere' }}>
+          <code>{item.name || item.id || 'unknown'}</code>
+          {item.id && item.id !== item.name ? ` · ${item.id}` : ''}
+          {item.source ? ` · ${item.source}` : ''}
+          {item.origin && item.origin !== 'local' ? ` (${item.origin})` : ''}
+          {item.sha256 ? ` · sha256:${item.sha256.slice(0, 12)}` : ''}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+interface ScopeItemWarning {
+  label: string
+  tooltip: string
+}
+
+function staleSkillWarning(skill: any): ScopeItemWarning | undefined {
+  if (!skill?.installed_stale) return undefined
+  const name = skill.name || skill.title || skill.id || 'This skill'
+  const reason = skill.stale_reason
+  if (reason === 'library_skill_changed') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} was installed before its bundled library instructions changed. Fix: open Skills, uninstall it, then install it again.`,
+    }
+  }
+  if (reason === 'installed_body_differs_from_library') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} differs from the bundled library copy. Fix: duplicate it as a custom skill if you need the local edits, then uninstall and reinstall the library skill.`,
+    }
+  }
+  if (reason === 'library_skill_missing') {
+    return {
+      label: 'Stale',
+      tooltip: `${name} points to a library entry that is no longer installed. Fix: update or reinstall the plugin that supplied it, or uninstall it and create a custom replacement.`,
+    }
+  }
+  return {
+    label: 'Stale',
+    tooltip: `${name} is out of date. Fix: open Skills, uninstall it, then install the current library copy.`,
+  }
+}
+
+function ScopeGroup({ name, items, selectedIds, getId, getName, describe, getWarning, onChange, mono = false }: {
   name: string
   items: any[]
   selectedIds: string[] | null
   getId: (item: any) => string
   getName?: (item: any) => string
   describe: (item: any) => string | undefined
+  getWarning?: (item: any) => ScopeItemWarning | undefined
   onChange: (ids: string[] | null) => void
   mono?: boolean
 }) {
@@ -1895,12 +2258,20 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
   const allOn = selectedIds === null
   const off = allOn ? 0 : Math.max(0, items.length - selectedIds.length)
   const visible = showAll ? items : items.slice(0, 6)
+  const warningCount = getWarning
+    ? items.reduce((count, item) => count + (getWarning(item) ? 1 : 0), 0)
+    : 0
   return (
     <div style={{ borderTop: '1px solid var(--line)', padding: '10px 0' }}>
       <button type="button" onClick={() => setExpanded(value => !value)} aria-expanded={expanded} style={{ display: 'flex', width: '100%', alignItems: 'center', gap: 7, border: 0, padding: 0, background: 'transparent', color: 'var(--ink)', cursor: 'pointer', textAlign: 'left' }}>
         <RightOutlined style={{ fontSize: 9, transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform .15s' }} />
         <span style={{ fontSize: 13, fontWeight: 600 }}>{name}</span>
         <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>{items.length}</span>
+        {warningCount > 0 && (
+          <Tooltip title="Installed library instructions differ from the current bundled copies. Hover a stale skill below for repair steps.">
+            <Tag color="orange" style={{ margin: 0, fontSize: 10, lineHeight: '17px', paddingInline: 5 }}>{warningCount} stale</Tag>
+          </Tooltip>
+        )}
         <span style={{ marginLeft: 'auto', color: off ? 'var(--warn)' : 'var(--good)', fontSize: 11.5 }}>{items.length ? off ? `${off} off` : 'all on' : 'none defined'}</span>
       </button>
       {expanded && visible.map(item => {
@@ -1908,6 +2279,7 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
         const configuredName = getName?.(item)
         const displayName = configuredName && configuredName !== id ? configuredName : humanizeScopeId(id)
         const detail = describe(item)
+        const warning = getWarning?.(item)
         const on = selectedIds === null || selectedIds.includes(id)
         return (
           <div key={id} style={{ display: 'flex', minWidth: 0, alignItems: 'center', gap: 8, padding: '8px 2px 0 18px' }}>
@@ -1919,6 +2291,11 @@ function ScopeGroup({ name, items, selectedIds, getId, getName, describe, onChan
               <div title={displayName} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontFamily: mono ? 'var(--mono)' : undefined, fontSize: 13 }}>{displayName}</div>
               {displayName !== id && <div title={id} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--faint)', fontFamily: 'var(--mono)', fontSize: 11 }}>{id}</div>}
             </div>
+            {warning && (
+              <Tooltip title={warning.tooltip}>
+                <Tag color="orange" style={{ flex: '0 0 auto', margin: 0, fontSize: 10, lineHeight: '17px', paddingInline: 5 }}>{warning.label}</Tag>
+              </Tooltip>
+            )}
             {detail && <span title={detail} style={{ flex: '0 1 34%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', color: 'var(--faint)', fontSize: 11, textAlign: 'right', whiteSpace: 'nowrap' }}>{detail}</span>}
           </div>
         )
@@ -2023,6 +2400,21 @@ function MessageBubble({ message, onFileClick }: { message: AGUIMessage; onFileC
         {isUser ? <span style={{ whiteSpace: 'pre-wrap' }}>{message.content}</span> : <MarkdownContent content={message.content} onFileClick={onFileClick} />}
       </div>
     </div>
+  )
+}
+
+function RunNotice({ message }: { message: AGUIMessage }) {
+  const title = message.stopReason === 'max_turns'
+    ? `Agent stopped after reaching ${message.maxTurns || 'the configured number of'} turns`
+    : 'Agent stopped before the task finished'
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      title={title}
+      description={message.content}
+      style={{ marginBottom: 18 }}
+    />
   )
 }
 

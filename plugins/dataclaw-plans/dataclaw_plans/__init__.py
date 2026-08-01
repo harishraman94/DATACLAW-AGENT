@@ -12,7 +12,7 @@ from dataclaw.providers.tool.implementations.python_tool import PythonTool
 from dataclaw_plans.tools import propose_plan, update_plan, list_plans, get_plan, accept_gate_risk
 from dataclaw_plans.mlflow_tools import query_mlflow_runs
 from dataclaw_plans.router import router as plans_router, mlflow_router
-from dataclaw_plans.hooks import active_plan_context_hook
+from dataclaw_plans.hooks import active_plan_context_hook, planning_reasoning_hook
 from dataclaw_plans.gates import GateRiskAcceptanceGuardrail
 
 
@@ -27,8 +27,22 @@ class PlansPlugin:
 
         # Register hooks
         ctx.hooks.register("preToolCallHook", active_plan_context_hook)
+        # Runs right before the agent turn: elevates reasoning while drafting a plan.
+        ctx.hooks.register("postToolAvailabilityHook", planning_reasoning_hook)
         if ctx.guardrail_registry is not None:
             ctx.guardrail_registry.register(GateRiskAcceptanceGuardrail())
+        if ctx.session_cleanup_registry is not None:
+            from dataclaw_plans.mlflow_tools import delete_session_experiment
+            from dataclaw_plans.store import delete_session_records
+
+            def _cleanup_session(session):
+                session_id = str(session.get("id") or "")
+                return {
+                    **delete_session_records(session_id),
+                    "mlflow": delete_session_experiment(session_id),
+                }
+
+            ctx.session_cleanup_registry.register("plans", _cleanup_session)
 
         # Register tools
         _tools = [
@@ -40,11 +54,27 @@ class PlansPlugin:
                     "plan_markdown": {
                         "type": "string",
                         "description": (
-                            "Detailed Markdown review document for plan.md. Include objective, prior observations, "
-                            "assumptions or data limits, grouped workstreams, validation checks, deliverables, "
-                            "risks or open questions, and execution notes. This should be richer than the compact steps."
+                            "Required detailed Markdown review document for plan.md — the substance a lead reviews, "
+                            "richer than the compact steps. Do not leave this empty. Write in plain analyst "
+                            "prose — no self-praise adjectives, filler transitions, heading-restating bold "
+                            "lead-ins, or reflexive three-item lists; every sentence must be checkable or "
+                            "actionable. For substantial work, open with a one-line provenance header "
+                            "(Provenance: playbooks=<names|none>; hypotheses=<hyp-ids|none recorded>), then cover "
+                            "these labeled sections (a quick-answer ask needs only a few lines):\n"
+                            "- Objective and what is already known from prior inspection — map each workstream to the "
+                            "hypotheses or questions it addresses.\n"
+                            "- Method and rationale — the analytical approach chosen for the question type and data "
+                            "shape, with the main alternatives considered and rejected (e.g. a causal design vs a "
+                            "predictive model).\n"
+                            "- Assumptions, data limitations, and threats to validity, with how each is controlled "
+                            "(leakage, confounding, selection bias, non-stationarity, multiple comparisons, "
+                            "insufficient statistical power).\n"
+                            "- Baseline, success threshold, and evaluation protocol appropriate to the data (e.g. "
+                            "time-based or group-aware splits to avoid leakage).\n"
+                            "- Grouped workstreams, explicit out-of-scope / non-goals, validation and QA checks, "
+                            "expected deliverables (a governed HTML report when the analysis is substantial or "
+                            "elaborate), risks or open questions, and execution order."
                         ),
-                        "default": "",
                     },
                     "steps": {
                         "type": "array",
@@ -66,7 +96,7 @@ class PlansPlugin:
                     },
                     "context": {"type": "string", "description": "Additional context", "default": ""},
                 },
-                "required": ["name", "description", "steps"],
+                "required": ["name", "description", "steps", "plan_markdown"],
             }),
             ("update_plan", "Update progress for steps on an existing plan", update_plan, {
                 "type": "object",

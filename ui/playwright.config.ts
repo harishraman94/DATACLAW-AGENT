@@ -14,7 +14,10 @@ export default defineConfig({
     {
       command: '.venv/bin/python -m uvicorn dataclaw.api.app:create_app --factory --host 127.0.0.1 --port 8001',
       cwd: '..',
-      env: { DATACLAW_HOME: '/tmp/dataclaw-playwright-e2e' },
+      // Replace the creative report author's live-model calls with a
+      // deterministic stub so report-artifact-flow does not depend on model
+      // output clearing the structural gate. Test-only; see visual_author.py.
+      env: { DATACLAW_HOME: '/tmp/dataclaw-playwright-e2e', DATACLAW_VISUAL_AUTHOR_E2E_STUB: '1' },
       url: 'http://127.0.0.1:8001/docs',
       reuseExistingServer: false,
       timeout: 120_000,

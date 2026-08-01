@@ -113,11 +113,13 @@ async def list_sessions(project_id: str | None = None, *, independent_only: bool
 
 
 async def delete_session(session_id: str) -> bool:
-    """Delete a session."""
+    """Permanently remove a session record after its owned data is cleaned."""
     path = _session_path(session_id)
     if not path.exists():
         return False
     async with _get_lock(session_id):
+        if not path.exists():
+            return False
         path.unlink()
     _locks.pop(session_id, None)
     return True
@@ -193,6 +195,31 @@ async def update_session(session_id: str, updates: dict[str, Any]) -> dict[str, 
         path.write_text(json.dumps(data, indent=2, default=str))
 
     return data
+
+
+async def upsert_capability_receipt(
+    session_id: str,
+    receipt: dict[str, Any],
+) -> bool:
+    """Atomically insert or update one run's capability receipt."""
+    path = _session_path(session_id)
+    if not path.exists():
+        return False
+
+    async with _get_lock(session_id):
+        data = _normalize_session_scope(json.loads(path.read_text()))
+        receipts = list(data.get("capabilityReceipts") or [])
+        run_id = receipt.get("runId")
+        for index, current in enumerate(receipts):
+            if isinstance(current, dict) and current.get("runId") == run_id:
+                receipts[index] = receipt
+                break
+        else:
+            receipts.append(receipt)
+        data["capabilityReceipts"] = receipts
+        data["updatedAt"] = _now_iso()
+        path.write_text(json.dumps(data, indent=2, default=str))
+    return True
 
 
 async def save_subagent_conversation(

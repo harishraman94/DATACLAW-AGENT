@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from dataclaw.config.paths import plugin_data_dir
 from dataclaw_data.registry import (
@@ -18,7 +21,12 @@ from dataclaw_data.registry import (
     refresh_dataset,
     update_dataset_fields,
 )
-from dataclaw_data.tools import data_preview_data
+from dataclaw_data.tools import (
+    configured_max_notebook_rows,
+    data_export_dataframe,
+    data_preview_data,
+    dataset_access_scope,
+)
 
 UPLOADS_DIR = plugin_data_dir("data") / "uploads"
 
@@ -44,12 +52,13 @@ class DatasetUpdateRequest(BaseModel):
 
 @router.get("/datasets")
 async def list_datasets() -> list[dict[str, Any]]:
-    return read_datasets()
+    return await asyncio.to_thread(read_datasets)
 
 
 @router.post("/datasets")
 async def create(req: DatasetCreateRequest) -> dict[str, Any]:
-    return create_dataset(
+    return await asyncio.to_thread(
+        create_dataset,
         name=req.name,
         ds_type=req.type,
         connection=req.connection,
@@ -101,7 +110,8 @@ async def upload_dataset(
         dest = folder
         ds_type = "local_file"
 
-    return create_dataset(
+    return await asyncio.to_thread(
+        create_dataset,
         name=ds_name,
         ds_type=ds_type,
         connection=str(dest),
@@ -112,7 +122,7 @@ async def upload_dataset(
 @router.get("/datasets/{dataset_id}")
 async def get_dataset(dataset_id: str) -> dict[str, Any]:
     try:
-        return find_dataset(dataset_id)
+        return await asyncio.to_thread(find_dataset, dataset_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
@@ -120,14 +130,18 @@ async def get_dataset(dataset_id: str) -> dict[str, Any]:
 @router.patch("/datasets/{dataset_id}")
 async def update_dataset(dataset_id: str, req: DatasetUpdateRequest) -> dict[str, Any]:
     try:
-        return update_dataset_fields(dataset_id, req.model_dump(exclude_unset=True))
+        return await asyncio.to_thread(
+            update_dataset_fields,
+            dataset_id,
+            req.model_dump(exclude_unset=True),
+        )
     except ValueError:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
 
 @router.delete("/datasets/{dataset_id}")
 async def remove_dataset(dataset_id: str) -> dict[str, str]:
-    if not delete_dataset(dataset_id):
+    if not await asyncio.to_thread(delete_dataset, dataset_id):
         raise HTTPException(status_code=404, detail="Dataset not found")
     return {"status": "deleted"}
 
@@ -135,7 +149,7 @@ async def remove_dataset(dataset_id: str) -> dict[str, str]:
 @router.post("/datasets/{dataset_id}/refresh")
 async def refresh(dataset_id: str) -> dict[str, Any]:
     try:
-        return refresh_dataset(dataset_id)
+        return await asyncio.to_thread(refresh_dataset, dataset_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
@@ -157,26 +171,109 @@ class DataFrameRequest(BaseModel):
     session_id: str | None = None
 
 
+async def _authorized_dataset_ids(req: DataFrameRequest) -> list[str] | None:
+    """Validate notebook session access and return its dataset allowlist."""
+    if not req.session_id:
+        raise HTTPException(status_code=401, detail="A valid session_id is required")
+
+    from dataclaw.storage.sessions import get_session
+
+    session = await get_session(req.session_id)
+    if session is None:
+        raise HTTPException(status_code=401, detail="A valid session_id is required")
+
+    allowed_ids = session.get("datasetIds")
+    if allowed_ids is not None and req.dataset_id not in allowed_ids:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Dataset '{req.dataset_id}' is not enabled for this session",
+        )
+    return allowed_ids
+
+
+def _validate_dataframe_request(req: DataFrameRequest) -> None:
+    if bool(req.table_name) == bool(req.sql):
+        raise HTTPException(400, "Provide exactly one of table_name or sql")
+
+
 @router.post("/dataframe")
 async def dataframe(req: DataFrameRequest) -> dict[str, Any]:
-    """Endpoint for the dataclaw_data notebook package — returns rows + columns.
-
-    The notebook runtime needs full result sets to materialize DataFrames, so
-    the LLM-tool row cap is bypassed here. Callers can still narrow with
-    n_rows; None on either branch means "no cap, return everything".
-    """
+    """Return a session-authorized, bounded preview payload."""
     from dataclaw_data.tools import data_preview_data, data_query_data
+
+    _validate_dataframe_request(req)
+    allowed_ids = await _authorized_dataset_ids(req)
+
+    row_ceiling = configured_max_notebook_rows()
+    if req.n_rows is not None and req.n_rows <= 0:
+        raise HTTPException(status_code=400, detail="n_rows must be greater than zero")
+    row_limit = min(req.n_rows, row_ceiling) if req.n_rows is not None else row_ceiling
+
     try:
-        if req.sql:
-            return await data_query_data(
-                dataset_id=req.dataset_id, sql=req.sql, max_rows=req.n_rows,
-            )
-        elif req.table_name:
-            return await data_preview_data(
-                dataset_id=req.dataset_id, table_name=req.table_name,
-                n_rows=req.n_rows,
-            )
-        else:
-            raise HTTPException(400, "Provide table_name or sql")
+        with dataset_access_scope(allowed_ids):
+            if req.sql:
+                result = await data_query_data(
+                    dataset_id=req.dataset_id,
+                    sql=req.sql,
+                    max_rows=row_limit,
+                )
+            elif req.table_name:
+                result = await data_preview_data(
+                    dataset_id=req.dataset_id,
+                    table_name=req.table_name,
+                    n_rows=row_limit,
+                )
+            else:
+                raise HTTPException(400, "Provide table_name or sql")
+        result["row_limit"] = row_limit
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+def _exports_dir() -> Path:
+    return plugin_data_dir("data") / "exports"
+
+
+def _delete_export(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+@router.post("/dataframe/export")
+async def dataframe_export(req: DataFrameRequest) -> FileResponse:
+    """Stream an authorized, uncapped analysis result as Parquet.
+
+    DuckDB materializes the result directly to disk and FileResponse streams
+    it, avoiding both the preview cap and a giant in-memory JSON response.
+    """
+    _validate_dataframe_request(req)
+    if req.n_rows is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Full exports do not accept n_rows; use /dataframe for bounded previews",
+        )
+    allowed_ids = await _authorized_dataset_ids(req)
+
+    export_path = _exports_dir() / f"{uuid.uuid4().hex}.parquet"
+    try:
+        with dataset_access_scope(allowed_ids):
+            await data_export_dataframe(
+                dataset_id=req.dataset_id,
+                table_name=req.table_name,
+                sql=req.sql,
+                output_path=export_path,
+            )
+    except ValueError as exc:
+        _delete_export(export_path)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        _delete_export(export_path)
+        raise
+
+    return FileResponse(
+        export_path,
+        media_type="application/vnd.apache.parquet",
+        filename="dataclaw-result.parquet",
+        headers={"X-Dataclaw-Access-Mode": "full"},
+        background=BackgroundTask(_delete_export, export_path),
+    )

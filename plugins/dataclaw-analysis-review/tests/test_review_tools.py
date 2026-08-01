@@ -671,9 +671,17 @@ def _bind_stub_reviewer(monkeypatch, reply: str) -> _StubProvider:
     from dataclaw_analysis_review import reviewer
 
     provider = _StubProvider(reply)
-    providers = SimpleNamespace(sub_agent_registry=_StubRegistry(provider), sub_agent_hooks=None)
+    providers = SimpleNamespace(
+        sub_agent_registry=_StubRegistry(provider),
+        sub_agent_hooks=None,
+        skill=None,
+    )
+    class _ToolRegistry:
+        async def resolve_tools(self, state):
+            return [], {}
+
     monkeypatch.setitem(reviewer._runtime, "providers", providers)
-    monkeypatch.setitem(reviewer._runtime, "tool_registry", SimpleNamespace(_tools={}))
+    monkeypatch.setitem(reviewer._runtime, "tool_registry", _ToolRegistry())
     return provider
 
 
@@ -720,6 +728,69 @@ def test_reviewer_definition_and_prompt_render():
     prompt = render_reviewer_system_prompt()
     assert "Output contract" in prompt
     assert "fenced JSON array" in prompt
+
+
+@pytest.mark.asyncio
+async def test_reviewer_uses_only_session_scoped_installed_rubric(monkeypatch):
+    from dataclaw.config.paths import skills_dir
+    from dataclaw.providers.skill.implementations.file_skill import FileSkillProvider
+    from dataclaw.storage import sessions
+    from dataclaw_analysis_review import reviewer
+
+    provider = _bind_stub_reviewer(monkeypatch, "```json\n[]\n```")
+    skill_path = skills_dir() / "analysis_review.md"
+    skill_path.parent.mkdir(parents=True, exist_ok=True)
+    skill_path.write_text(
+        "---\nname: Session Reviewer\ndescription: scoped\n---\n"
+        "CUSTOM SESSION RUBRIC",
+        encoding="utf-8",
+    )
+    session_id = "reviewer-skill-scope"
+    await sessions.create_session(session_id=session_id, skill_ids=[])
+    reviewer._runtime["providers"].skill = FileSkillProvider(skills_dir())
+
+    without_skill = await reviewer.run_reviewer("audit", session_id=session_id)
+    assert without_skill["reviewer_skill"] is None
+    assert "CUSTOM SESSION RUBRIC" not in provider.contexts[-1].config["system_prompt"]
+
+    await sessions.update_session(session_id, {"skillIds": ["analysis_review"]})
+    with_skill = await reviewer.run_reviewer("audit", session_id=session_id)
+    assert with_skill["reviewer_skill"]["id"] == "analysis_review"
+    assert with_skill["reviewer_skill"]["source"] == "installed"
+    assert "CUSTOM SESSION RUBRIC" in provider.contexts[-1].config["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_cannot_restore_disabled_read_tools(monkeypatch):
+    from dataclaw_analysis_review import reviewer
+
+    provider = _bind_stub_reviewer(monkeypatch, "```json\n[]\n```")
+
+    class _ScopedToolRegistry:
+        def __init__(self):
+            self.resolve_calls = []
+            self._tools = {"list_artifacts": object(), "list_eda_findings": object()}
+
+        async def resolve_tools(self, state):
+            self.resolve_calls.append(state)
+
+            async def list_artifacts(**kwargs):
+                return {"artifacts": []}
+
+            return (
+                [{"name": "list_artifacts", "description": "list", "parameters": {}}],
+                {"list_artifacts": list_artifacts},
+            )
+
+    registry = _ScopedToolRegistry()
+    reviewer._runtime["tool_registry"] = registry
+
+    await reviewer.run_reviewer("audit", session_id="reviewer-tool-scope")
+
+    context = provider.contexts[-1]
+    assert [tool["name"] for tool in context.tools] == ["list_artifacts"]
+    assert set(context.tool_callables) == {"list_artifacts"}
+    assert registry.resolve_calls[0]["session_id"] == "reviewer-tool-scope"
 
 
 @pytest.mark.asyncio

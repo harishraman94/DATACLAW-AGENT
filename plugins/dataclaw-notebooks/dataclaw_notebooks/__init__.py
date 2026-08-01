@@ -34,6 +34,23 @@ class NotebooksPlugin:
 
         # Store on app state for lifespan cleanup
         ctx.app.state.notebook_manager = mgr
+        if ctx.session_cleanup_registry is not None:
+            async def _cleanup_session_notebooks(session):
+                # Project notebooks belong to the shared project directory.
+                if session.get("projectId"):
+                    return {"closed": []}
+                session_root = (workspaces_dir() / str(session.get("id") or "")).resolve()
+                closed: list[str] = []
+                for name, state in list(mgr._notebooks.items()):
+                    try:
+                        Path(state.path).resolve().relative_to(session_root)
+                    except ValueError:
+                        continue
+                    await mgr.close(name)
+                    closed.append(name)
+                return {"closed": closed}
+
+            ctx.session_cleanup_registry.register("notebooks", _cleanup_session_notebooks)
 
         # Hook: inject session and project context into notebook manager before tool calls
         async def _inject_session_context(state):

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable, Iterator
 
 from dataclaw.state import AgentState
 from dataclaw.providers.tool.provider import ToolProvider
@@ -16,6 +17,7 @@ from dataclaw.providers.tool.tool_config import (
     save_global_tool_config,
     load_project_tool_config,
     save_project_tool_config,
+    session_tool_config_from_dict,
     bump_version,
 )
 from dataclaw.schema import ToolDefinition
@@ -54,27 +56,56 @@ def _resolve_project_dir(project_id: str) -> Path | None:
 class DefaultToolAvailability:
     """Resolves tools from a registry of ToolProvider instances.
 
-    Supports enable/disable filtering at global and project level,
-    and a monotonic version counter for change detection (OpenClaw polling).
+    Supports enable/disable filtering at global, project, and session level,
+    plus a monotonic config/runtime-change counter for OpenClaw polling.
     """
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolProvider] = {}
         self._tool_config: ToolConfig = load_global_tool_config()
+        self._registration_source = "builtin"
+        self._registration_finalized = False
 
     @property
     def version(self) -> int:
         return self._tool_config.version
 
     def register_tool(self, tool: ToolProvider) -> None:
-        """Register a tool provider and bump version."""
+        """Register a tool provider, attaching the active plugin provenance."""
+        definition = tool.definition
+        if (
+            self._registration_source != "builtin"
+            and definition.get("source", "builtin") == "builtin"
+        ):
+            definition["source"] = self._registration_source
+            if hasattr(tool, "source"):
+                tool.source = self._registration_source
         self._tools[tool.name] = tool
-        self._bump()
+        # Startup discovery rebuilds this in-memory map on every launch and
+        # must not masquerade as a persistent config revision. Registrations
+        # after startup (custom tools/MCP reconnects) remain observable.
+        if self._registration_finalized:
+            self._bump()
 
     def unregister_tool(self, name: str) -> None:
         """Remove a tool by name and bump version."""
         if self._tools.pop(name, None) is not None:
-            self._bump()
+            if self._registration_finalized:
+                self._bump()
+
+    @contextmanager
+    def registration_source(self, source: str) -> Iterator[None]:
+        """Apply provenance to default-sourced tools registered in this block."""
+        previous = self._registration_source
+        self._registration_source = source or "builtin"
+        try:
+            yield
+        finally:
+            self._registration_source = previous
+
+    def finalize_registration(self) -> None:
+        """Mark startup discovery complete so later registry changes bump version."""
+        self._registration_finalized = True
 
     def has_tool(self, name: str) -> bool:
         """Return True if a tool with this name is registered.
@@ -153,21 +184,53 @@ class DefaultToolAvailability:
         project_id: str | None = None,
         session_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return all tools with their enabled status (for the tools listing API)."""
+        """Return tools with their effective scope/config status."""
+        allowed_ids: list[str] | None = None
+        session_config = None
+        if session_id:
+            session_data = _load_session_data(session_id)
+            if session_data is None:
+                allowed_ids = []
+            else:
+                if session_data.get("toolIds") is not None:
+                    allowed_ids = session_data["toolIds"]
+                session_config = session_tool_config_from_dict(
+                    session_data.get("toolConfig")
+                )
+                project_id = (
+                    project_id
+                    or session_data.get("projectId")
+                    or session_data.get("project_id")
+                )
+
         project_config = None
         if project_id:
             project_dir = _resolve_project_dir(project_id)
             if project_dir:
                 project_config = load_project_tool_config(project_dir)
+            if allowed_ids is None:
+                try:
+                    from dataclaw_projects.registry import get_project
 
-        session_config = _load_session_tool_config(session_id) if session_id else None
+                    project = get_project(project_id)
+                    if project.get("tool_ids") is not None:
+                        allowed_ids = project["tool_ids"]
+                except Exception:
+                    allowed_ids = []
 
         result = []
         for tool in self._tools.values():
             d = dict(tool.definition)
-            d["enabled"] = is_tool_enabled(
-                tool.name, self._tool_config, project_config, session_config,
+            d["enabled"] = (
+                (allowed_ids is None or tool.name in allowed_ids)
+                and is_tool_enabled(
+                    tool.name,
+                    self._tool_config,
+                    project_config,
+                    session_config,
+                )
             )
+            d["in_scope"] = allowed_ids is None or tool.name in allowed_ids
             result.append(d)
         return result
 
@@ -177,24 +240,44 @@ class DefaultToolAvailability:
     ) -> tuple[list[ToolDefinition], dict[str, Callable[..., Awaitable[dict[str, Any]]]]]:
         """Return enabled tools for this turn.
 
-        Filtering layers (highest priority first):
-        1. Session ``toolIds`` allowlist (from session JSON)
-        2. Project ``tool_ids`` allowlist (from project metadata)
-        3. Global disabled list (from tool-config.json)
+        Allowlists define the hard scope (session, then project). Within that
+        scope, enable/disable configuration resolves at session > project >
+        global priority.
         """
-        # Load session data for toolIds allowlist
+        # Load session data once for both the hard toolIds scope and
+        # session-level toolConfig overrides.
         allowed_ids: list[str] | None = None
+        session_config = None
         session_id = state.get("session_id")
         if session_id:
             session_data = _load_session_data(session_id)
-            if session_data:
+            if session_data is None:
+                # Session-aware invocation boundaries should already reject
+                # this request. Keep the provider fail-closed as defense in
+                # depth for internal/subagent callers.
+                allowed_ids = []
+            else:
                 session_tool_ids = session_data.get("toolIds")
                 if session_tool_ids is not None:
                     allowed_ids = session_tool_ids
+                session_config = session_tool_config_from_dict(
+                    session_data.get("toolConfig")
+                )
+                if not state.get("project_id"):
+                    state["project_id"] = (
+                        session_data.get("projectId")
+                        or session_data.get("project_id")
+                    )
 
         # Fall back to project-level allowlist
+        project_config = None
+        project_id = state.get("project_id")
+        if project_id:
+            project_dir = _resolve_project_dir(project_id)
+            if project_dir:
+                project_config = load_project_tool_config(project_dir)
+
         if allowed_ids is None:
-            project_id = state.get("project_id")
             if project_id:
                 try:
                     from dataclaw_projects.registry import get_project
@@ -203,7 +286,7 @@ class DefaultToolAvailability:
                     if project_tool_ids is not None:
                         allowed_ids = project_tool_ids
                 except Exception:
-                    pass
+                    allowed_ids = []
 
         definitions: list[ToolDefinition] = []
         callables: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {}
@@ -211,8 +294,12 @@ class DefaultToolAvailability:
             # If an allowlist is active, tool must be in it
             if allowed_ids is not None and name not in allowed_ids:
                 continue
-            # Also respect global disabled list
-            if name in self._tool_config.disabled:
+            if not is_tool_enabled(
+                name,
+                self._tool_config,
+                project_config,
+                session_config,
+            ):
                 continue
             definitions.append(tool.definition)
             callables[name] = tool.execute

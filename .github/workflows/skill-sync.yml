@@ -1,0 +1,32 @@
+name: skill-sync
+
+# Guards that skills mirrored into the openclaw plugin stay byte-identical to
+# their canonical skill-library/ source. The parity test is dependency-light
+# (pathlib + pytest, no app imports), so this job stays fast and isolated.
+
+on:
+  push:
+    paths:
+      - "skill-library/**"
+      - "openclaw-plugins/dataclaw/skills/**"
+      - "tests/test_skill_manifest_sync.py"
+  pull_request:
+    paths:
+      - "skill-library/**"
+      - "openclaw-plugins/dataclaw/skills/**"
+      - "tests/test_skill_manifest_sync.py"
+
+jobs:
+  skill-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pytest-asyncio
+      # --noconftest keeps this job dependency-light: the shared tests/conftest.py
+      # eagerly imports the app (fastapi et al.), which this isolated job does not
+      # install. The parity test uses no fixtures from it, so skipping conftest
+      # loading is safe and preserves the fast, app-import-free design.
+      - run: pytest tests/test_skill_manifest_sync.py --noconftest -v -o addopts=""

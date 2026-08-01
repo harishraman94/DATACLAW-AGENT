@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from dataclaw.config.paths import plugin_data_dir
+from dataclaw.mlflow_compat import MLFLOW_REQUIREMENT
 
 META_DIR_NAME = ".dataclaw"
 
@@ -74,7 +75,7 @@ REQUIRED_PACKAGES = [
     "nbformat>=4.2.0", # Plotly fig.show() mime rendering refuses to run without it
     "requests",        # DataClaw runtime API calls
     "duckdb",          # DataClaw SQL queries
-    "mlflow",          # Experiment logging
+    MLFLOW_REQUIREMENT,  # Experiment logging; must match the host tracking schema
     "tabulate",        # Enables pandas df.to_markdown() for compact LLM views
 ]
 
@@ -93,6 +94,19 @@ DEFAULT_OPTIONAL_PACKAGES = [
 ]
 
 DEFAULT_PACKAGES = REQUIRED_PACKAGES + DEFAULT_OPTIONAL_PACKAGES
+
+
+def _package_name(requirement: str) -> str:
+    """Return a normalized distribution name from a simple package requirement."""
+    name = re.split(r"[\s<>=!~\[;]", requirement.strip(), maxsplit=1)[0]
+    return name.lower().replace("_", "-")
+
+
+def ensure_required_packages(packages: list[str]) -> list[str]:
+    """Replace user-supplied variants of required packages with canonical specs."""
+    required_names = {_package_name(pkg) for pkg in REQUIRED_PACKAGES}
+    optional = [pkg for pkg in packages if _package_name(pkg) not in required_names]
+    return [*REQUIRED_PACKAGES, *optional]
 
 
 def create_project(
@@ -120,12 +134,9 @@ def create_project(
     meta_dir = user_dir / META_DIR_NAME
     meta_dir.mkdir(exist_ok=True)
 
-    if packages is None:
-        packages = list(DEFAULT_PACKAGES)
-    # Always ensure required packages are present
-    for pkg in REQUIRED_PACKAGES:
-        if pkg not in packages:
-            packages.append(pkg)
+    packages = ensure_required_packages(
+        list(DEFAULT_PACKAGES) if packages is None else list(packages)
+    )
 
     meta: dict[str, Any] = {
         "id": slug,

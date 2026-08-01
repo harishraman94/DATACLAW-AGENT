@@ -44,16 +44,14 @@ async def call_tool(tool_name: str, body: ToolCallRequest, request: Request) -> 
     providers = request.app.state.providers
     hooks = request.app.state.hooks
 
-    # Resolve project_id from session
-    project_id: str | None = None
-    if body.session_id:
-        try:
-            from dataclaw.storage import sessions
-            session_data = await sessions.get_session(body.session_id)
-            if session_data:
-                project_id = session_data.get("projectId")
-        except Exception:
-            pass
+    if not body.session_id:
+        raise HTTPException(400, "session_id is required")
+    from dataclaw.storage import sessions
+
+    session_data = await sessions.get_session(body.session_id)
+    if session_data is None:
+        raise HTTPException(404, "Session not found")
+    project_id: str | None = session_data.get("projectId")
 
     call_id = f"direct-{uuid.uuid4().hex[:8]}"
 
@@ -98,6 +96,11 @@ async def call_tool(tool_name: str, body: ToolCallRequest, request: Request) -> 
     _, tool_callables = await providers.tool_availability.resolve_tools(state)
     fn = tool_callables.get(tool_name)
     if fn is None:
+        if providers.tool_availability.has_tool(tool_name):
+            raise HTTPException(
+                403,
+                f"Tool '{tool_name}' is registered but disabled for this session",
+            )
         raise HTTPException(404, f"Unknown tool: {tool_name}")
 
     try:

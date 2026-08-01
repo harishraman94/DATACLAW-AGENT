@@ -7,10 +7,48 @@ track either.
 
 from __future__ import annotations
 
+from dataclaw.config.resolver import resolve
 from dataclaw.state import AgentState
-from dataclaw_plans.store import find_proposal, get_active_plan_id
+from dataclaw_plans.store import find_proposal, get_active_plan_id, read_proposals
 
 PLAN_TOOLS = {"propose_plan", "update_plan", "list_plans", "get_plan", "query_mlflow_runs"}
+
+# Statuses that mean the session has moved past plan drafting into execution.
+_APPROVED_STATUSES = {"approved", "running", "completed"}
+
+
+def _in_planning_phase(session_id: str) -> bool:
+    """True while the session is still drafting/awaiting a plan (no approved plan yet).
+
+    Covers pre-plan EDA, the plan-drafting turn, and any pre-approval revisions;
+    flips to False once a plan is approved and execution begins.
+    """
+    if not session_id:
+        return False
+    for p in read_proposals():
+        if p.get("session_id") == session_id and p.get("status") in _APPROVED_STATUSES:
+            return False
+    return True
+
+
+async def planning_reasoning_hook(state: AgentState) -> AgentState:
+    """postToolAvailabilityHook: give the plan-drafting turn a deeper reasoning budget.
+
+    Plan drafting is the most consequential turn in the flow but is otherwise
+    emitted at the model's default (no thinking budget). While the session is in
+    the planning phase, set a per-turn reasoning effort that the agent provider
+    passes through to the LLM; ordinary execution turns run at the default.
+
+    Authoritative and idempotent: it also *clears* a previously-set effort once
+    the plan is approved partway through a single run (e.g. auto-mode, where
+    propose_plan auto-approves), so execution turns in that run are not left
+    elevated by a value carried over from the drafting turn.
+    """
+    configured = resolve("plugins.plans.reasoning_effort", "DATACLAW_PLANS_REASONING_EFFORT", "high")
+    desired = configured if (configured and _in_planning_phase(state.get("session_id", ""))) else ""
+    if desired == (state.get("reasoning_effort") or ""):
+        return state
+    return {**state, "reasoning_effort": desired}
 
 
 def _step_identity(step: dict) -> str:

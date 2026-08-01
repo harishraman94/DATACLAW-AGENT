@@ -1,5 +1,7 @@
 """Tests for skill providers."""
 
+import asyncio
+
 import pytest
 
 from dataclaw.providers.skill.implementations.file_skill import FileSkillProvider
@@ -38,14 +40,14 @@ def _write_library_skill(library_dir, name, meta_yaml, body):
 
 @pytest.mark.asyncio
 async def test_resolve_empty(provider):
-    result = await provider.resolve_skills({"session_id": "t", "messages": []})
+    result = await provider.resolve_skills({"messages": []})
     assert result == []
 
 
 @pytest.mark.asyncio
 async def test_resolve_skills(provider, skill_dir):
     _write_skill(skill_dir, "profiling", "name: profiling\ndescription: Profile data", "Step 1: Load data")
-    result = await provider.resolve_skills({"session_id": "t", "messages": []})
+    result = await provider.resolve_skills({"messages": []})
     assert len(result) == 1
     assert result[0]["id"] == "profiling"
     assert result[0]["name"] == "profiling"
@@ -54,7 +56,7 @@ async def test_resolve_skills(provider, skill_dir):
 @pytest.mark.asyncio
 async def test_format_for_prompt(provider, skill_dir):
     _write_skill(skill_dir, "test", "name: test\ndescription: A test skill", "Do the thing")
-    skills = await provider.resolve_skills({"session_id": "t", "messages": []})
+    skills = await provider.resolve_skills({"messages": []})
     fragments = await provider.format_for_prompt(skills)
     assert len(fragments) == 1
     assert "test" in fragments[0]
@@ -75,7 +77,7 @@ async def test_fetch_nonexistent(provider):
 
 
 @pytest.mark.asyncio
-async def test_fetch_uninstalled_library_skill(provider, library_dir):
+async def test_fetch_uninstalled_library_skill_is_rejected(provider, library_dir):
     _write_library_skill(
         library_dir,
         "report_design",
@@ -83,12 +85,47 @@ async def test_fetch_uninstalled_library_skill(provider, library_dir):
         "Call report_design_report for final reports",
     )
 
-    await provider.resolve_skills({"session_id": "t", "messages": []})
+    await provider.resolve_skills({"messages": []})
     result = await provider.fetch_skill("report_design")
 
-    assert result["id"] == "report_design"
-    assert result["from_library"] is True
-    assert "Call report_design_report" in result["content"]
+    assert result == {
+        "content": "Skill not found: report_design",
+        "is_error": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolved_skills_are_isolated_between_concurrent_requests(
+    provider, skill_dir, monkeypatch
+):
+    _write_skill(skill_dir, "alpha", "name: alpha", "Alpha instructions")
+    _write_skill(skill_dir, "beta", "name: beta", "Beta instructions")
+    monkeypatch.setattr(
+        provider,
+        "_resolve_allowed_ids",
+        lambda state: list(state["allowed"]),
+    )
+    alpha_resolved = asyncio.Event()
+    beta_resolved = asyncio.Event()
+
+    async def alpha_request():
+        await provider.resolve_skills({"allowed": ["alpha"]})
+        alpha_resolved.set()
+        await beta_resolved.wait()
+        return await provider.fetch_skill("skill_1")
+
+    async def beta_request():
+        await alpha_resolved.wait()
+        await provider.resolve_skills({"allowed": ["beta"]})
+        beta_resolved.set()
+        return await provider.fetch_skill("skill_1")
+
+    alpha, beta = await asyncio.gather(alpha_request(), beta_request())
+
+    assert alpha["skill_id"] == "alpha"
+    assert alpha["name"] == "alpha"
+    assert beta["skill_id"] == "beta"
+    assert beta["name"] == "beta"
 
 
 @pytest.mark.asyncio
@@ -101,7 +138,7 @@ async def test_stale_library_skill_is_warned_in_prompt_and_fetch(provider, skill
         "old instructions",
     )
 
-    skills = await provider.resolve_skills({"session_id": "t", "messages": []})
+    skills = await provider.resolve_skills({"messages": []})
     assert skills[0]["installed_stale"] is True
 
     fragments = await provider.format_for_prompt(skills)
@@ -110,7 +147,24 @@ async def test_stale_library_skill_is_warned_in_prompt_and_fetch(provider, skill
 
     fetched = await provider.fetch_skill("visualization")
     assert fetched["installed_stale"] is True
+    assert fetched["installed"] is True
+    assert fetched["source"] == "installed"
+    assert fetched["origin"] == "library"
     assert "Skill freshness warning" in fetched["content"]
-    assert "Using the bundled skill-library instructions" in fetched["content"]
-    assert "new instructions" in fetched["content"]
-    assert "old instructions" not in fetched["content"]
+    assert "installed copy below remains the active source" in fetched["content"]
+    assert "old instructions" in fetched["content"]
+    assert "new instructions" not in fetched["content"]
+
+
+@pytest.mark.asyncio
+async def test_missing_session_skill_resolution_fails_closed(provider, skill_dir):
+    _write_skill(skill_dir, "private", "name: private", "Private instructions")
+
+    skills = await provider.resolve_skills({
+        "session_id": "session-does-not-exist",
+        "messages": [],
+    })
+    fetched = await provider.fetch_skill("private")
+
+    assert skills == []
+    assert fetched["is_error"] is True
