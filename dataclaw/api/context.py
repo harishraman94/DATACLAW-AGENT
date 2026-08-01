@@ -8,10 +8,13 @@ explicit parameter plumbing.
 from __future__ import annotations
 
 import contextvars
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from dataclaw.events.emitter import AgentEventEmitter
 
 current_thread_id: contextvars.ContextVar[str] = contextvars.ContextVar("current_thread_id")
 current_emitter: contextvars.ContextVar[AgentEventEmitter] = contextvars.ContextVar("current_emitter")
+current_runtime_bundle: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "current_runtime_bundle"
+)

@@ -117,6 +117,13 @@ def build_review_context(
             for finding in fold_findings(session_id)
             if str(finding.get("plan_step_id") or "") == target_id and finding.get("status") == "active"
         ]
+        proposal_findings = [
+            finding
+            for finding in fold_findings(session_id)
+            if finding.get("status") == "active"
+            and context.get("proposal_id")
+            and str(finding.get("proposal_id") or "") == str(context.get("proposal_id"))
+        ]
         linked_hypotheses = {str(f.get("hypothesis_id") or "") for f in findings if f.get("hypothesis_id")}
         hypotheses = [
             hyp
@@ -125,6 +132,7 @@ def build_review_context(
             or str(hyp.get("hypothesis_id") or "") in linked_hypotheses
         ]
         context["eda_findings"] = findings
+        context["proposal_eda_findings"] = proposal_findings
         context["eda_hypotheses"] = hypotheses
         if step and step_claims_model(step):
             context["mlflow_runs"] = session_run_metadata(session_id)
@@ -192,7 +200,10 @@ def _plan_step_checks(context: dict[str, Any]) -> list[dict[str, Any]]:
             )
 
     if completed and step_claims_eda(step):
-        readiness = _latest_readiness_finding(findings)
+        readiness = _latest_readiness_finding([
+            *findings,
+            *(context.get("proposal_eda_findings") or []),
+        ])
         if readiness is None:
             results.append(
                 _finding(

@@ -33,6 +33,13 @@ from dataclaw_eda.store import (
 )
 
 MANDATORY_EXTERNAL_CAVEAT = "unverified against external evidence"
+SELECTION_SENSITIVE_FINDING_TYPES = {
+    "correlation_candidate",
+    "distribution",
+    "missingness",
+    "outlier",
+    "segment_difference",
+}
 
 
 def _error(code: str, message: str, **details: Any) -> dict[str, Any]:
@@ -424,7 +431,11 @@ async def record_eda_finding(
                 "validation.internal.evidence_refs such as 'notebook_cell:<cell_id>'."
             ),
         )
-    if internal["status"] == "validated" and _selection_requires_correction(effective_selection):
+    if (
+        internal["status"] == "validated"
+        and finding_type in SELECTION_SENSITIVE_FINDING_TYPES
+        and _selection_requires_correction(effective_selection)
+    ):
         return _error(
             "screened_validation_requires_correction",
             "Screened findings with screened_n > 5 require correction or holdout confirmation before internal validation counts as validated",
@@ -597,6 +608,7 @@ async def summarize_eda_readiness(
         mode=mode,
         required_checks=required_checks,
         plan_step_id=plan_step_id,
+        proposal_id=proposal_id,
     )
     severity = "blocker" if verdict["status"] == "blocked" else "warning" if verdict["status"] in {"unknown", "ready_with_caveats"} else "info"
     validation = {

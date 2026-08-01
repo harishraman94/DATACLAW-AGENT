@@ -65,6 +65,21 @@ def make_delegate_to_subagent(
             SubAgentContext,
         )
 
+        # A runtime reload may replace the global registry while this parent
+        # run is still active. Resolve every provider used by delegation from
+        # the run's captured immutable bundle when one is present.
+        effective_providers = providers
+        effective_tool_registry = tool_registry
+        try:
+            from dataclaw.api.context import current_runtime_bundle
+
+            captured = current_runtime_bundle.get()
+            if captured is not None:
+                effective_providers = captured
+                effective_tool_registry = captured.tool_availability
+        except LookupError:
+            pass
+
         # Reject delegations to subagents not enabled for this chat session.
         # Mirrors `_check_dataset_allowed` in dataclaw_data — the agent can
         # see the subagent definition exists, but the session-level filter
@@ -84,7 +99,7 @@ def make_delegate_to_subagent(
             }
 
         agent_type = definition.get("agent_type", "llm")
-        registry = providers.sub_agent_registry
+        registry = effective_providers.sub_agent_registry
         sub_agent = registry.get(agent_type)
         if sub_agent is None:
             available = [t["agent_type"] for t in registry.list_types()]
@@ -110,11 +125,15 @@ def make_delegate_to_subagent(
                 project_id = str((session or {}).get("projectId") or "")
             except Exception:
                 pass
-        resolved_tools, resolved_callables = await tool_registry.resolve_tools({
-            "session_id": session_id,
-            "project_id": project_id,
-            "messages": [],
-        })
+        resolved_tools, resolved_callables = (
+            await effective_tool_registry.resolve_tools(
+                {
+                    "session_id": session_id,
+                    "project_id": project_id,
+                    "messages": [],
+                }
+            )
+        )
         tools = [
             tool
             for tool in resolved_tools
@@ -151,13 +170,13 @@ def make_delegate_to_subagent(
             tool_callables=tool_callables,
             config=sa_config,
             emit=emit,
-            sub_agent_hooks=providers.sub_agent_hooks,
+            sub_agent_hooks=effective_providers.sub_agent_hooks,
             prior_messages=prior_messages,
             conversation_id=conversation_id,
         )
 
         # Run pre-delegate hooks
-        hooks = providers.sub_agent_hooks
+        hooks = effective_providers.sub_agent_hooks
         delegate_event = DelegateEvent(
             subagent_name=subagent_name,
             agent_type=agent_type,
@@ -227,13 +246,15 @@ def _build_emit_callback():
 def _resolve_project_dir() -> str | None:
     """Resolve the active project's working directory.
 
-    The workspace plugin sets _project_dir per-request via a preToolCallHook
+    The workspace plugin sets the project directory via a preToolCallHook
     when a project is active. We read it here to inject into subagent config.
     """
     try:
-        from dataclaw_workspace.tools import _project_dir
-        if _project_dir is not None:
-            return str(_project_dir)
+        from dataclaw_workspace.tools import get_project_dir
+
+        project_dir = get_project_dir()
+        if project_dir is not None:
+            return str(project_dir)
     except ImportError:
         pass
     return None

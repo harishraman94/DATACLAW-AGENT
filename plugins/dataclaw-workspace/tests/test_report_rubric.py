@@ -581,6 +581,55 @@ def test_critique_requires_resolvable_baseline_evidence_and_results():
     assert "missing_baseline_comparison" in findings
 
 
+def test_critique_accepts_qualified_string_baseline_evidence():
+    storyboard = report_renderer.design_report_storyboard(
+        report_goal="Forecast next-quarter demand.",
+        insights=[{"title": "Demand forecast", "detail": "Demand is forecast to rise."}],
+        requirements={
+            "evidence_registry": {"targets": [{
+                "id": "notebook_cell:baseline-1",
+                "kind": "notebook_cell",
+                "present": True,
+            }]},
+            "analysis_review": {
+                "mode": "predictive",
+                "enforcement": "strict",
+                "baseline": {
+                    "status": "complete",
+                    "method": "Shared-holdout seasonal naive comparison",
+                    "result": "The candidate reduced MAE by 8%.",
+                    "evidence": ["notebook_cell:baseline-1"],
+                },
+                "uncertainty": {"status": "complete", "method": "bootstrap"},
+            },
+        },
+    )
+
+    _critiqued, critique = report_renderer.critique_report_storyboard(storyboard)
+
+    assert critique["analytical_review"]["enforcement"] == "strict"
+    assert "missing_baseline_comparison" not in {
+        finding["id"] for finding in critique["analytical_review"]["findings"]
+    }
+
+
+def test_explicit_descriptive_mode_overrides_negated_predictive_language():
+    storyboard = report_renderer.design_report_storyboard(
+        report_goal="Explain player archetypes; this is not a predictive model or forecast.",
+        insights=[{"title": "Archetypes", "detail": "Observed player profiles overlap."}],
+        requirements={"analysis_review": {
+            "mode": "exploratory_segmentation_descriptive_report",
+        }},
+    )
+
+    _critiqued, critique = report_renderer.critique_report_storyboard(storyboard)
+
+    assert critique["analytical_review"]["mode"] == "exploratory_segmentation_descriptive_report"
+    assert "missing_baseline_comparison" not in {
+        finding["id"] for finding in critique["analytical_review"]["findings"]
+    }
+
+
 def test_critique_does_not_apply_forecast_checks_to_a_descriptive_report():
     storyboard = report_renderer.design_report_storyboard(
         report_goal="Explain observed customer retention by cohort.",

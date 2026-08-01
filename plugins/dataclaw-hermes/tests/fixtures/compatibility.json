@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "package": "hermes-agent",
+  "version": "0.19.0",
+  "tag": "v2026.7.20",
+  "revision": "3ef6bbd201263d354fd83ec55b3c306ded2eb72a",
+  "license": "MIT",
+  "python": ">=3.11,<3.14",
+  "startupCommand": "hermes -p dataclaw gateway start",
+  "captureMethod": "source-contract inspection at the pinned revision",
+  "liveCapture": false,
+  "contracts": {
+    "runsInput": [
+      "input",
+      "session_id",
+      "instructions",
+      "conversation_history",
+      "model"
+    ],
+    "providerOverrideAccepted": false,
+    "eventReplay": false,
+    "toolCallIdHook": "pre_tool_call",
+    "toolHandlerReceivesToolCallId": false,
+    "toolExposure": "global plugin toolset restricted to dataclaw",
+    "utilityLLMFullContract": false,
+    "callbackTimeoutMaximum": "httpx configurable/unbounded"
+  }
+}

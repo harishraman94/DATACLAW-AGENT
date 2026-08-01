@@ -24,6 +24,19 @@ class MemoryIngestHook:
         self._provider = provider
 
     async def __call__(self, state: AgentState) -> AgentState:
+        # Runtime bundles are immutable snapshots, while this hook object is
+        # registered once at application startup. Resolve the provider from
+        # the captured run bundle so a reload cannot pair a new run with the
+        # previous bundle's memory provider.
+        provider = self._provider
+        try:
+            from dataclaw.api.context import current_runtime_bundle
+
+            bundle = current_runtime_bundle.get()
+            provider = getattr(bundle, "memory", provider)
+        except LookupError:
+            pass
+
         messages = state.get("messages", [])
         if len(messages) < 2:
             return state
@@ -58,7 +71,7 @@ class MemoryIngestHook:
 
         session_id = state.get("session_id")
         try:
-            await self._provider.save_memory(
+            await provider.save_memory(
                 summary,
                 metadata={
                     "session_id": session_id,

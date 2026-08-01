@@ -81,7 +81,7 @@ export interface ToolProgress {
 
 export interface RunHealth {
   running: boolean
-  status: 'running' | 'finished' | 'error' | 'unknown'
+  status: 'queued' | 'running' | 'waiting_approval' | 'stopping' | 'completed' | 'failed' | 'cancelled' | 'finished' | 'error' | 'unknown'
   healthy: boolean
   task_status: 'running' | 'done' | 'cancelled' | 'unknown'
   run_id?: string
@@ -91,6 +91,8 @@ export interface RunHealth {
   last_progress_at?: string | null
   last_output_at?: string | null
   active_tool?: Record<string, unknown> | null
+  requires_user_action?: boolean
+  pending_actions?: PendingAction[]
   server_time?: string
   reachable: boolean
   checkedAt: number
@@ -103,9 +105,29 @@ export interface GuardrailState {
   message: string
   severity: 'info' | 'warning' | 'danger'
   mode: 'auto_reply' | 'user_approval'
-  status: 'pending' | 'approved' | 'denied' | 'auto_replied' | 'post_intervention'
+  status: 'pending' | 'approved' | 'denied' | 'timed_out' | 'cancelled' | 'unavailable' | 'auto_replied' | 'post_intervention'
   approvalId?: string
+  createdAt?: string
+  expiresAt?: string
+  feedback?: string
+  tool?: { name?: string; arguments?: Record<string, unknown> }
   order: number
+}
+
+export interface PendingAction {
+  id: string
+  kind?: string
+  state?: string
+  requiresUserAction?: boolean
+  runId?: string
+  guardrailId?: string
+  toolCallId?: string
+  message?: string
+  severity?: 'info' | 'warning' | 'danger'
+  createdAt?: string
+  expiresAt?: string
+  feedback?: string | null
+  tool?: { name?: string; arguments?: Record<string, unknown> }
 }
 
 export type TimelineItem =
@@ -225,7 +247,7 @@ function findActiveDelegateIdx(toolCalls: ToolCallState[]): number {
   return toolCalls.findIndex(tc => tc.name === 'delegate_to_subagent' && tc.status === 'calling')
 }
 
-export function useAGUI(options?: { onRunFinished?: () => void }) {
+export function useAGUI(options?: { onRunStarted?: () => void; onRunFinished?: () => void; onRunError?: () => void; onConnectionError?: () => void }) {
   const [state, setState] = useState<AGUIState>({
     messages: [],
     toolCalls: [],
@@ -243,6 +265,43 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
   // but still update orderRef so subsequent events get correct ordering
   const skipSnapshotRef = useRef(false)
 
+  const mergePendingActions = useCallback((actions: PendingAction[]) => {
+    if (!Array.isArray(actions) || actions.length === 0) return
+    setState(prev => {
+      const guardrails = [...prev.guardrails]
+      for (const action of actions) {
+        if (!action?.id) continue
+        const existingIndex = guardrails.findIndex(item => item.approvalId === action.id)
+        const rawStatus = String(action.state || 'pending')
+        const status: GuardrailState['status'] = [
+          'approved', 'denied', 'timed_out', 'cancelled', 'unavailable',
+        ].includes(rawStatus)
+          ? rawStatus as GuardrailState['status']
+          : 'pending'
+        const existing = existingIndex >= 0 ? guardrails[existingIndex] : null
+        if (!existing) orderRef.current++
+        const guardrail: GuardrailState = {
+          id: existing?.id || `guardrail-${action.toolCallId || action.id}`,
+          guardrailId: action.guardrailId || existing?.guardrailId || 'guardrail',
+          toolCallId: action.toolCallId || existing?.toolCallId || '',
+          message: action.message || existing?.message || 'Approval required',
+          severity: action.severity || existing?.severity || 'warning',
+          mode: 'user_approval',
+          status,
+          approvalId: action.id,
+          createdAt: action.createdAt || existing?.createdAt,
+          expiresAt: action.expiresAt || existing?.expiresAt,
+          feedback: action.feedback ?? existing?.feedback,
+          tool: action.tool || existing?.tool,
+          order: existing?.order || orderRef.current,
+        }
+        if (existingIndex >= 0) guardrails[existingIndex] = guardrail
+        else guardrails.push(guardrail)
+      }
+      return { ...prev, guardrails }
+    })
+  }, [])
+
   const processEvent = useCallback((event: BaseEvent) => {
     switch (event.type) {
       case EventType.MESSAGES_SNAPSHOT: {
@@ -258,13 +317,22 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
           break
         }
 
-        orderRef.current = maxOrder
-        setState(prev => ({ ...prev, messages: msgs, toolCalls: tcs }))
+        orderRef.current = Math.max(orderRef.current, maxOrder)
+        setState(prev => {
+          let nextOrder = maxOrder
+          const guardrails = prev.guardrails.map(guardrail => ({
+            ...guardrail,
+            order: ++nextOrder,
+          }))
+          orderRef.current = Math.max(orderRef.current, nextOrder)
+          return { ...prev, messages: msgs, toolCalls: tcs, guardrails }
+        })
         break
       }
 
       case EventType.RUN_STARTED:
         setState(prev => prev.reconnecting ? { ...prev, reconnecting: false } : prev)
+        setTimeout(() => options?.onRunStarted?.(), 0)
         break
 
       case EventType.TEXT_MESSAGE_START: {
@@ -371,6 +439,7 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
       case EventType.RUN_ERROR: {
         const e = event as RunErrorEvent
         setState(prev => ({ ...prev, isRunning: false, isStopping: false, reconnecting: false, runHealth: null, error: e.message || 'Unknown error' }))
+        setTimeout(() => options?.onRunError?.(), 0)
         break
       }
 
@@ -478,18 +547,36 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
             mode: 'user_approval',
             status: 'pending',
             approvalId: value?.approvalId || '',
+            createdAt: value?.createdAt,
+            expiresAt: value?.expiresAt,
+            tool: value?.tool,
             order: orderRef.current,
           }
-          setState(prev => ({ ...prev, guardrails: [...prev.guardrails, guardrail] }))
+          setState(prev => {
+            const existing = prev.guardrails.find(item => item.approvalId === guardrail.approvalId)
+            if (!existing) return { ...prev, guardrails: [...prev.guardrails, guardrail] }
+            return {
+              ...prev,
+              guardrails: prev.guardrails.map(item => item.approvalId === guardrail.approvalId
+                ? { ...guardrail, id: existing.id }
+                : item),
+            }
+          })
           break
         }
 
         if (name === 'guardrail:approved' || name === 'guardrail:denied') {
-          const status = name === 'guardrail:approved' ? 'approved' : 'denied'
+          const status: GuardrailState['status'] = name === 'guardrail:approved'
+            ? 'approved'
+            : value?.state === 'timed_out'
+              ? 'timed_out'
+              : 'denied'
           setState(prev => ({
             ...prev,
             guardrails: prev.guardrails.map(g =>
-              g.approvalId === value?.approvalId ? { ...g, status } : g
+              g.approvalId === value?.approvalId
+                ? { ...g, status, feedback: value?.feedback ?? g.feedback }
+                : g
             ),
           }))
           break
@@ -679,6 +766,7 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
       next: processEvent,
       error: (err: any) => {
         setState(prev => ({ ...prev, isRunning: false, isStopping: false, reconnecting: false, error: err.message || 'Connection failed' }))
+        setTimeout(() => options?.onConnectionError?.(), 0)
       },
       complete: () => {
         setState(prev => prev.isRunning ? { ...prev, isRunning: false, isStopping: false } : prev)
@@ -749,6 +837,7 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
           ...prev,
           runHealth: { ...payload, reachable: true, checkedAt: Date.now() },
         }))
+        mergePendingActions(payload.pending_actions || [])
       } catch {
         if (disposed) return
         setState(prev => ({
@@ -772,7 +861,7 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
       window.clearTimeout(initialTimer)
       window.clearInterval(timer)
     }
-  }, [state.isRunning])
+  }, [mergePendingActions, state.isRunning])
 
   const reset = useCallback(() => {
     subRef.current?.unsubscribe()
@@ -788,6 +877,19 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
 
   const setToolCalls = useCallback((toolCalls: ToolCallState[]) => {
     setState(prev => ({ ...prev, toolCalls }))
+  }, [])
+
+  const updateGuardrailDecision = useCallback((
+    approvalId: string,
+    status: 'approved' | 'denied',
+    feedback?: string,
+  ) => {
+    setState(prev => ({
+      ...prev,
+      guardrails: prev.guardrails.map(guardrail => guardrail.approvalId === approvalId
+        ? { ...guardrail, status, feedback: feedback || guardrail.feedback }
+        : guardrail),
+    }))
   }, [])
 
   const setInitialOrder = useCallback((order: number) => {
@@ -810,6 +912,8 @@ export function useAGUI(options?: { onRunFinished?: () => void }) {
     reset,
     setMessages,
     setToolCalls,
+    mergePendingActions,
+    updateGuardrailDecision,
     setInitialOrder,
   }
 }

@@ -72,6 +72,7 @@ async def create_session(
         "autoTurnsUsed": 0,
         "queuedMessages": [],
         "queuePaused": False,
+        "pendingActions": [],
         "messages": [],
         "createdAt": _now_iso(),
         "updatedAt": _now_iso(),
@@ -220,6 +221,65 @@ async def upsert_capability_receipt(
         data["updatedAt"] = _now_iso()
         path.write_text(json.dumps(data, indent=2, default=str))
     return True
+
+
+async def upsert_pending_action(
+    session_id: str,
+    action: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Atomically persist one user-action request on a chat session.
+
+    Approval prompts must survive an SSE disconnect.  Keep resolved requests as
+    well as pending ones so reconnecting clients can explain what happened and
+    duplicate decision submissions can be handled idempotently.
+    """
+    path = _session_path(session_id)
+    if not path.exists():
+        return None
+
+    async with _get_lock(session_id):
+        data = _normalize_session_scope(json.loads(path.read_text()))
+        actions = list(data.get("pendingActions") or [])
+        action_id = action.get("id")
+        for index, current in enumerate(actions):
+            if isinstance(current, dict) and current.get("id") == action_id:
+                actions[index] = action
+                break
+        else:
+            actions.append(action)
+        # This is an audit/recovery surface, not an unbounded event log.
+        data["pendingActions"] = actions[-50:]
+        data["updatedAt"] = _now_iso()
+        path.write_text(json.dumps(data, indent=2, default=str))
+    return action
+
+
+async def update_pending_action(
+    session_id: str,
+    action_id: str,
+    updates: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Atomically update one persisted user-action request."""
+    path = _session_path(session_id)
+    if not path.exists():
+        return None
+
+    async with _get_lock(session_id):
+        data = _normalize_session_scope(json.loads(path.read_text()))
+        actions = list(data.get("pendingActions") or [])
+        updated: dict[str, Any] | None = None
+        for index, current in enumerate(actions):
+            if not isinstance(current, dict) or current.get("id") != action_id:
+                continue
+            updated = {**current, **updates, "updatedAt": _now_iso()}
+            actions[index] = updated
+            break
+        if updated is None:
+            return None
+        data["pendingActions"] = actions[-50:]
+        data["updatedAt"] = _now_iso()
+        path.write_text(json.dumps(data, indent=2, default=str))
+    return updated
 
 
 async def save_subagent_conversation(

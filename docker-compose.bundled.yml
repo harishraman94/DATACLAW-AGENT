@@ -16,10 +16,11 @@ services:
       DATACLAW_PORT: ${DATACLAW_PORT:-8000}
       OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT:-18789}
       OPENCLAW_BRIDGE_PORT: ${OPENCLAW_BRIDGE_PORT:-18790}
-      # Pass through only when explicitly set on the host. Defaulting it
-      # forces every container into openclaw mode and silently overrides
-      # the user's saved llm.backend choice (env vars beat the config
-      # file in the resolver).
+      # Runtime and utility provider are separate. Leave both unset to use the
+      # saved config file.
+      DATACLAW_AGENT_RUNTIME:
+      DATACLAW_UTILITY_BACKEND:
+      # Legacy combined override, retained for older deployments.
       DATACLAW_LLM_BACKEND:
       # Optional overrides — only passed when set on the host.
       # When unset, the entrypoint derives sensible defaults

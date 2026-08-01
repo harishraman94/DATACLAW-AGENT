@@ -25,6 +25,10 @@ class SubAgentRegistry:
         """Look up the provider for the given agent_type."""
         return self._providers.get(agent_type)
 
+    def items(self):
+        """Iterate registered provider pairs for immutable bundle snapshots."""
+        return tuple(self._providers.items())
+
     def list_types(self) -> list[dict[str, Any]]:
         """Return registered agent types with their config schemas (for UI)."""
         result = []

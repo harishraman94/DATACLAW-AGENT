@@ -13,6 +13,7 @@ import { useAGUI } from '../hooks/useAGUI'
 import type { AGUIMessage, RunHealth, ToolCallState } from '../hooks/useAGUI'
 import MarkdownContent from '../components/MarkdownContent'
 import { groupTranscript, TurnActivity } from '../components/ChatActivity'
+import GuardrailCard from '../components/GuardrailCard'
 import { toolBaseName } from '../components/reportPublishState'
 import PlanPanel from '../components/PlanPanel'
 import ArtifactPanel from '../components/ArtifactPanel'
@@ -79,6 +80,9 @@ function describeRunStatus(
   if (state.isStopping) return 'Stopping the current run…'
   if (state.reconnecting) return 'Reconnecting to the current run…'
   if (health && !health.reachable) return 'Run status is temporarily unavailable — reconnecting…'
+  if (health?.status === 'waiting_approval' || health?.requires_user_action) {
+    return 'Action required — approve or deny the pending request below.'
+  }
   if (health && !health.healthy && health.task_status !== 'unknown') {
     return `Run needs attention — task is ${health.task_status}`
   }
@@ -274,6 +278,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const [input, setInput] = useState('')
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [queuePaused, setQueuePaused] = useState(false)
+  const [queueError, setQueueError] = useState<string | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const skipNextLoadRef = useRef(false)
@@ -304,6 +309,8 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const pendingPlanDecisionRef = useRef<{ sessionId: string; text: string } | null>(null)
   const queuedMessagesRef = useRef<QueuedMessage[]>([])
   const queuePausedRef = useRef(false)
+  const dispatchingQueuedIdRef = useRef<string | null>(null)
+  const queueSaveRevisionRef = useRef(0)
   const sendNextAfterStopRef = useRef(false)
   const datasetConfirmationOpenRef = useRef(false)
   const commitQueueRef = useRef<(messages: QueuedMessage[], paused: boolean) => void>(() => {})
@@ -506,6 +513,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   useEffect(() => { autoMessageRef.current = autoMessage }, [autoMessage])
   useEffect(() => { maxAutoTurnsRef.current = maxAutoTurns }, [maxAutoTurns])
   useEffect(() => { activeSessionIdRef.current = activeSessionId }, [activeSessionId])
+  useEffect(() => { dispatchingQueuedIdRef.current = null }, [activeSessionId])
   useEffect(() => { queuedMessagesRef.current = queuedMessages }, [queuedMessages])
   useEffect(() => { queuePausedRef.current = queuePaused }, [queuePaused])
 
@@ -514,12 +522,19 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     queuePausedRef.current = paused
     setQueuedMessages(next)
     setQueuePaused(paused)
+    setQueueError(null)
     const sessionId = activeSessionIdRef.current
     if (sessionId) {
+      const revision = ++queueSaveRevisionRef.current
       fetch(`${API}/chat/sessions/${sessionId}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ queuedMessages: next, queuePaused: paused }),
-      }).catch(() => {})
+      }).then(response => {
+        if (!response.ok) throw new Error(`Queue could not be saved (${response.status})`)
+      }).catch(error => {
+        if (queueSaveRevisionRef.current !== revision) return
+        setQueueError(error instanceof Error ? error.message : 'Queue could not be saved')
+      })
     }
   }, [])
   useEffect(() => { commitQueueRef.current = commitQueue }, [commitQueue])
@@ -530,13 +545,15 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const dispatchQueuedMessage = useCallback(() => {
     const sessionId = activeSessionIdRef.current
-    const [next, ...rest] = queuedMessagesRef.current
-    if (!sessionId || !next || queuePausedRef.current) return false
-    commitQueue(rest, false)
+    const [next] = queuedMessagesRef.current
+    if (!sessionId || !next || queuePausedRef.current || dispatchingQueuedIdRef.current) return false
+    // Keep the item durable until RUN_STARTED confirms the backend accepted
+    // the replacement run. A transport failure therefore leaves work queued.
+    dispatchingQueuedIdRef.current = next.id
     setManualResumePending(false)
     setTimeout(() => sendMessageRef.current(sessionId, [], next.text, { sentFromQueue: true, queuedAt: next.ts }), 0)
     return true
-  }, [commitQueue])
+  }, [])
   useEffect(() => { dispatchQueuedMessageRef.current = dispatchQueuedMessage }, [dispatchQueuedMessage])
 
   const onRunFinished = useCallback(() => {
@@ -564,7 +581,37 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     }, 2000)
   }, [])
 
-  const { messages, toolCalls, timeline, isRunning, isStopping, reconnecting, runHealth, error, sendMessage, cancelRun, checkAndReconnect, reset, setToolCalls } = useAGUI({ onRunFinished })
+  const onRunStarted = useCallback(() => {
+    const queuedId = dispatchingQueuedIdRef.current
+    if (!queuedId) return
+    dispatchingQueuedIdRef.current = null
+    commitQueueRef.current(
+      queuedMessagesRef.current.filter(message => message.id !== queuedId),
+      false,
+    )
+  }, [])
+
+  const onRunError = useCallback(() => {
+    if (dispatchingQueuedIdRef.current) {
+      // The queued message was never accepted; retain it and require an
+      // explicit retry instead of silently looping on the same failure.
+      dispatchingQueuedIdRef.current = null
+      commitQueueRef.current(queuedMessagesRef.current, true)
+      return
+    }
+    if (queuedMessagesRef.current.length > 0 && !queuePausedRef.current) {
+      dispatchQueuedMessageRef.current()
+    }
+  }, [])
+
+  const onConnectionError = useCallback(() => {
+    dispatchingQueuedIdRef.current = null
+    if (queuedMessagesRef.current.length > 0) {
+      commitQueueRef.current(queuedMessagesRef.current, true)
+    }
+  }, [])
+
+  const { messages, toolCalls, guardrails, timeline, isRunning, isStopping, reconnecting, runHealth, error, sendMessage, cancelRun, checkAndReconnect, reset, setToolCalls, mergePendingActions, updateGuardrailDecision } = useAGUI({ onRunStarted, onRunFinished, onRunError, onConnectionError })
   sendMessageRef.current = sendMessage
 
   // Skill-library freshness can change while the UI is open (for example after
@@ -780,6 +827,10 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const pendingPlans = useMemo(() => plans.filter(p => p.status === 'pending'), [plans])
   const latestPendingPlan = pendingPlans[pendingPlans.length - 1] ?? null
+  const pendingApproval = useMemo(
+    () => [...guardrails].reverse().find(guardrail => guardrail.status === 'pending') || null,
+    [guardrails],
+  )
   const resumeOpportunity = useMemo(() => findResumeOpportunity({
     messages,
     toolCalls,
@@ -829,7 +880,9 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
       : attentionPlan
         ? 'complete'
         : null
-  const composerPlaceholder = latestPendingPlan
+  const composerPlaceholder = pendingApproval
+    ? 'Resolve the approval request above before sending another message.'
+    : latestPendingPlan
     ? 'Type feedback or revision notes for this plan...'
     : isStopping
       ? 'Stopping the current run...'
@@ -952,6 +1005,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
         if (session?.guardrailConfig?.disabled) setGuardrailDisabled(session.guardrailConfig.disabled)
         else setGuardrailDisabled([])
         setCapabilityReceipts(Array.isArray(session?.capabilityReceipts) ? session.capabilityReceipts : [])
+        mergePendingActions(Array.isArray(session?.pendingActions) ? session.pendingActions : [])
         const restoredQueue = Array.isArray(session?.queuedMessages) ? session.queuedMessages : []
         queuedMessagesRef.current = restoredQueue
         queuePausedRef.current = Boolean(session?.queuePaused)
@@ -969,7 +1023,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
       }).catch(() => {})
     // Load messages via MessagesSnapshot (handles both history and active run reconnection)
     checkAndReconnect(activeSessionId)
-  }, [activeSessionId, reset, checkAndReconnect])
+  }, [activeSessionId, reset, checkAndReconnect, mergePendingActions])
   useEffect(() => {
     if (!activeSessionId || isRunning) return
     fetch(`${API}/chat/sessions/${activeSessionId}`)
@@ -1108,7 +1162,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
     if (isNearBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [messages, toolCalls])
+  }, [guardrails, messages, toolCalls])
 
   // Track scroll position to decide whether to auto-scroll
   const handleScroll = useCallback(() => {
@@ -1159,6 +1213,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
   const handleSend = async () => {
     const text = input.trim()
     if (!text) return
+    if (pendingApproval) return
     if (isRunning) {
       setInput('')
       const next = [...queuedMessagesRef.current, { id: crypto.randomUUID(), text, ts: Date.now() }]
@@ -1228,6 +1283,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
   const sendQueuedMessageNext = useCallback((id: string) => {
     const queue = queuedMessagesRef.current
+    if (queue[0]?.id === id) return
     const item = queue.find(message => message.id === id)
     if (!item) return
     commitQueue([item, ...queue.filter(message => message.id !== id)], queuePausedRef.current)
@@ -1448,7 +1504,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
         <div ref={scrollContainerRef} onScroll={handleScroll} style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: showSessionBrowser ? `42px ${chatHorizontalGutter}` : `26px ${chatHorizontalGutter} 12px` }}>
           {showSessionBrowser ? (
             <SessionBrowser sessions={sessions} onOpen={setActiveSessionId} onCreate={createSession} onDelete={sessionId => deleteSession(sessionId).catch(() => {})} />
-          ) : filteredTimeline.length === 0 && !isRunning ? (
+          ) : filteredTimeline.length === 0 && !isRunning && queuedMessages.length === 0 ? (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
               <Empty description="Start a conversation" image={Empty.PRESENTED_IMAGE_SIMPLE} />
             </div>
@@ -1464,7 +1520,7 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
               {windowedBlocks.map(block => (
                 <div key={block.kind === 'activity' ? block.group.id : block.entry.item.id} style={{ contentVisibility: 'auto', containIntrinsicSize: 'auto 56px' }}>
                   {block.kind === 'activity'
-                    ? <TurnActivity group={block.group} onFileClick={previewFile} sessionId={activeSessionId} />
+                    ? <TurnActivity group={block.group} onFileClick={previewFile} sessionId={activeSessionId} onGuardrailDecision={updateGuardrailDecision} />
                     : (block.entry.item as AGUIMessage).role === 'compaction'
                     ? <CompactionDivider message={block.entry.item as AGUIMessage} />
                     : (block.entry.item as AGUIMessage).role === 'run_notice'
@@ -1511,6 +1567,11 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
 
         {/* Input */}
         {!showSessionBrowser && <div style={{ padding: `10px ${chatHorizontalGutter} 14px`, borderTop: '1px solid var(--line)', background: 'var(--bg)' }}>
+          {pendingApproval && activeSessionId && (
+            <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto 8px' }} data-testid="pending-approval-banner">
+              <GuardrailCard guardrail={pendingApproval} threadId={activeSessionId} onDecision={updateGuardrailDecision} />
+            </div>
+          )}
           {latestPendingPlan && (
             <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto 8px', padding: '8px 10px', border: '1px solid #fedf89', borderRadius: 8, background: 'var(--warn-soft)', color: 'var(--warn)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }} role="status">
               <SafetyOutlined aria-hidden="true" />
@@ -1538,10 +1599,22 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
               <Button type="link" size="small" icon={<PlayCircleOutlined />} onClick={resumeQueue} style={{ marginLeft: 'auto', paddingInline: 0 }}>Resume</Button>
             </div>
           )}
+          {queueError && (
+            <Alert
+              type="error"
+              showIcon
+              closable
+              onClose={() => setQueueError(null)}
+              message="Queued work could not be saved"
+              description={queueError}
+              style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto 8px' }}
+            />
+          )}
           <div style={{ width: '100%', maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '0 auto', display: 'flex', gap: 10, alignItems: 'flex-end' }}>
             <Input.TextArea value={input} onChange={e => setInput(e.target.value)}
               onPressEnter={e => { if (!e.shiftKey) { e.preventDefault(); handleSend() } }}
               placeholder={composerPlaceholder}
+              disabled={Boolean(pendingApproval)}
               className={latestPendingPlan ? 'dataclaw-plan-feedback-composer' : undefined}
               autoSize={{ minRows: 1, maxRows: 6 }}
               style={{ borderRadius: 10 }} />
@@ -1569,14 +1642,14 @@ export default function ChatPage({ projectId, initialSessionId, initialDatasetId
                     if (activeSessionId) cancelRun(activeSessionId)
                   }} style={{ borderRadius: 10, height: 36 }}>Stop &amp; send next</Button>
                 )}
-                <Button type="primary" disabled={isStopping} onClick={handleSend} style={{ borderRadius: 10, height: 36 }}>Queue ↵</Button>
+                <Button type="primary" disabled={isStopping || Boolean(pendingApproval)} onClick={handleSend} style={{ borderRadius: 10, height: 36 }}>{pendingApproval ? 'Decision required' : 'Queue message'}</Button>
               </>
             ) : (
               <Button type="primary" icon={<SendOutlined />} onClick={handleSend}
                 style={{ borderRadius: 10, minWidth: 44, height: 32 }} />
             )}
           </div>
-          {isRunning && <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '6px auto 0', color: 'var(--faint)', fontSize: 11, textAlign: 'right' }}>{queuedMessages.length > 0 ? `${queuedMessages.length} message${queuedMessages.length === 1 ? '' : 's'} queued · ` : ''}↵ send — queues during a run · ⇧↵ newline</div>}
+          {isRunning && <div style={{ maxWidth: CHAT_SURFACE_MAX_WIDTH, margin: '6px auto 0', color: 'var(--faint)', fontSize: 11, textAlign: 'right' }}>{pendingApproval ? 'Use the approval controls above; Stop remains available.' : <>{queuedMessages.length > 0 ? `${queuedMessages.length} message${queuedMessages.length === 1 ? '' : 's'} queued · ` : ''}Messages sent during a run are added to the queue · ⇧↵ newline</>}</div>}
         </div>}
       </div>
 
@@ -2442,7 +2515,16 @@ function QueuedBubble({ message, position, paused, onEdit, onSendNext, onRemove 
           <span>Queued · {queuePosition(position)}</span>
           <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 2 }}>
             <Button type="text" size="small" icon={<EditOutlined />} onClick={() => onEdit(message.id)} aria-label="Edit queued message" style={{ width: 22, minWidth: 22, height: 20, padding: 0 }} />
-            <Button type="text" size="small" icon={<ArrowUpOutlined />} onClick={() => onSendNext(message.id)} aria-label="Send this message next" style={{ width: 22, minWidth: 22, height: 20, padding: 0 }} />
+            <Button
+              type="text"
+              size="small"
+              icon={<ArrowUpOutlined />}
+              disabled={position === 0}
+              title={position === 0 ? 'Already next in queue' : 'Move to front of queue'}
+              onClick={() => onSendNext(message.id)}
+              aria-label={position === 0 ? 'Already next in queue' : 'Move queued message to front'}
+              style={{ width: 22, minWidth: 22, height: 20, padding: 0 }}
+            />
             <Button type="text" size="small" icon={<CloseOutlined />} onClick={() => onRemove(message.id)} aria-label="Remove queued message" style={{ width: 22, minWidth: 22, height: 20, padding: 0 }} />
           </span>
         </div>

@@ -24,6 +24,7 @@ dependencies = [
     "dataclaw-projects",
     "dataclaw-browser",
     "dataclaw-openclaw",
+    "dataclaw-hermes",
     "dataclaw-custom-tools",
     "dataclaw-kaggle",
     "dataclaw-gbrain",
@@ -41,6 +42,7 @@ dataclaw-notebooks = { path = "plugins/dataclaw-notebooks", editable = true }
 dataclaw-projects = { path = "plugins/dataclaw-projects", editable = true }
 dataclaw-browser = { path = "plugins/dataclaw-browser", editable = true }
 dataclaw-openclaw = { path = "plugins/dataclaw-openclaw", editable = true }
+dataclaw-hermes = { path = "plugins/dataclaw-hermes", editable = true }
 dataclaw-custom-tools = { path = "plugins/dataclaw-custom-tools", editable = true }
 dataclaw-kaggle = { path = "plugins/dataclaw-kaggle", editable = true }
 dataclaw-gbrain = { path = "plugins/dataclaw-gbrain", editable = true }

@@ -1,0 +1,10 @@
+name: dataclaw
+version: "0.1.0"
+description: Governed Dataclaw tool dispatcher for Hermes Agent
+kind: standalone
+provides:
+  hooks:
+    - pre_tool_call
+  tools:
+    - dataclaw_tool
+    - dataclaw_tool_search

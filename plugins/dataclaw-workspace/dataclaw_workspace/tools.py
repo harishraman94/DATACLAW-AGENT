@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import json
 import re
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,12 +48,21 @@ from dataclaw_workspace.visual_author import (
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 # Project directory override — set per-request via hook when a project is active.
-_project_dir: Path | None = None
+# Tool providers are process singletons, so a module global races across chats.
+_project_dir: ContextVar[Path | None] = ContextVar(
+    "dataclaw_workspace_project_dir", default=None
+)
+_current_workspace_id: ContextVar[str] = ContextVar(
+    "dataclaw_workspace_id", default="default"
+)
 
 
 def set_project_dir(d: Path | None) -> None:
-    global _project_dir
-    _project_dir = d
+    _project_dir.set(d)
+
+
+def get_project_dir() -> Path | None:
+    return _project_dir.get()
 
 
 # ── Path helpers ────────────────────────────────────────────────────────────
@@ -63,13 +73,47 @@ def _safe_id(value: str) -> str:
     return safe or "default"
 
 
+def set_current_workspace_id(workspace_id: str | None) -> None:
+    _current_workspace_id.set(_safe_id(workspace_id or "default"))
+
+
+def get_current_workspace_id() -> str:
+    return _current_workspace_id.get()
+
+
+def _effective_workspace_id(workspace_id: str = "default") -> str:
+    explicit = _safe_id(workspace_id)
+    current = get_current_workspace_id()
+    return current if explicit == "default" and current != "default" else explicit
+
+
 def _base_dir(workspace_id: str = "default") -> Path:
-    if _project_dir is not None:
-        _project_dir.mkdir(parents=True, exist_ok=True)
-        return _project_dir
+    project_dir = get_project_dir()
+    if project_dir is not None:
+        project_dir.mkdir(parents=True, exist_ok=True)
+        return project_dir
     base = workspaces_dir() / _safe_id(workspace_id)
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def _strict_analytical_review_findings(analytical_review: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return findings that still block under the simplified review policy.
+
+    Analytical completeness is advisory unless the caller explicitly selects
+    strict enforcement. Self-containment remains blocking regardless of that
+    preference because remote runtimes violate the artifact contract.
+    """
+    strict = str(analytical_review.get("enforcement") or "advisory") == "strict"
+    always_block = {"external_runtime_dependency"}
+    return [
+        finding
+        for finding in analytical_review.get("findings", [])
+        if isinstance(finding, dict)
+        and str(finding.get("severity") or "").strip().lower() == "required"
+        and (strict or str(finding.get("id") or "") in always_block)
+        and str(finding.get("lifecycle_status") or "open") != "accepted_with_rationale"
+    ]
 
 
 def _resolve_path(workspace_id: str, path: str) -> Path:
@@ -250,6 +294,9 @@ def _sync_report_review_lifecycle(
             finding for finding in analytical_review.get("findings", [])
             if isinstance(finding, dict) and str(finding.get("id") or "").strip()
         ]
+        strict_enforcement = str(
+            analytical_review.get("enforcement") or "advisory"
+        ) == "strict"
         existing = [
             finding
             for finding in fold_review_findings(session_id)
@@ -276,6 +323,13 @@ def _sync_report_review_lifecycle(
                 active_records.append(previous)
                 continue
 
+            severity = str(finding.get("severity") or "warning")
+            if (
+                severity == "required"
+                and not strict_enforcement
+                and finding_id != "external_runtime_dependency"
+            ):
+                severity = "warning"
             record = {
                 "finding_id": new_finding_id(),
                 "review_id": review_id,
@@ -286,7 +340,7 @@ def _sync_report_review_lifecycle(
                 "source": _REPORT_REVIEW_ACTOR,
                 "actor": _REPORT_REVIEW_ACTOR,
                 "status": "open",
-                "severity": str(finding.get("severity") or "warning"),
+                "severity": severity,
                 "category": _REPORT_REVIEW_CATEGORY.get(
                     str(finding.get("category") or ""),
                     "reproducibility_gap",
@@ -366,6 +420,7 @@ def _sync_report_review_lifecycle(
         return {
             "available": True,
             "status": "synced",
+            "enforcement": "strict" if strict_enforcement else "advisory",
             "scope": _REPORT_REVIEW_SCOPE,
             "target_id": target_id,
             "review_id": review_id,
@@ -1501,7 +1556,7 @@ async def report_publish(
     review_lifecycle = _sync_report_review_lifecycle(
         analytical_review,
         html_sha256=actual_html_hash,
-        session_id=workspace_id,
+        session_id=_effective_workspace_id(workspace_id),
     )
     if review_lifecycle.get("status") == "error":
         raise ValueError(
@@ -1512,13 +1567,7 @@ async def report_publish(
     storyboard["analytical_review"] = analytical_review
     storyboard["review_lifecycle"] = review_lifecycle
     resolved_storyboard.write_text(json.dumps(storyboard, indent=2, default=str), encoding="utf-8")
-    required_review_findings = [
-        finding
-        for finding in analytical_review.get("findings", [])
-        if isinstance(finding, dict)
-        and str(finding.get("severity") or "").strip().lower() == "required"
-        and str(finding.get("lifecycle_status") or "open") != "accepted_with_rationale"
-    ]
+    required_review_findings = _strict_analytical_review_findings(analytical_review)
     if required_review_findings:
         finding_ids = ", ".join(str(finding.get("id") or "unknown").strip() for finding in required_review_findings)
         raise ValueError(
@@ -1792,6 +1841,18 @@ async def report_design_report(
     # document rather than choosing a treatment for a structure that later
     # mutates.
     storyboard, critique = _critique_report_storyboard(storyboard)
+    preflight_blockers = _strict_analytical_review_findings(
+        critique.get("analytical_review", {})
+    )
+    if preflight_blockers:
+        finding_ids = ", ".join(
+            str(finding.get("id") or "unknown") for finding in preflight_blockers
+        )
+        raise ValueError(
+            "Report analytical-review preflight failed before creative authoring: "
+            f"{finding_ids}. Complete the declared work or use "
+            "requirements.analysis_review.enforcement='advisory'."
+        )
     visual_author_cfg = visual_author_config(resolved_requirements, visual_author)
     evidence_ledger = _build_evidence_registry(storyboard)
     storyboard["evidence_registry"] = evidence_ledger
@@ -1893,7 +1954,7 @@ async def report_design_report(
     review_lifecycle = _sync_report_review_lifecycle(
         critique.get("analytical_review", {}),
         html_sha256=storyboard["rendered_html_sha256"],
-        session_id=workspace_id,
+        session_id=_effective_workspace_id(workspace_id),
     )
     analytical_review = _attach_review_lifecycle(final_analytical_review, review_lifecycle)
     critique["analytical_review"] = analytical_review

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+from fastapi import HTTPException
+
 from dataclaw.api.routers.chat import IncomingMessage, _extract_visual_artifacts, _stored_messages_to_llm, receive_message
 from dataclaw.capability_receipts import build_capability_receipt, record_tool_execution
 
@@ -138,6 +143,75 @@ async def test_queue_state_roundtrips_through_session_storage():
     assert loaded is not None
     assert loaded["queuedMessages"] == queued
     assert loaded["queuePaused"] is True
+
+
+async def test_pending_action_roundtrips_and_decisions_are_idempotent(monkeypatch):
+    """Approval state survives reconnects and duplicate button submissions."""
+    import dataclaw.api.run_tracker as run_tracker
+    from dataclaw.api.routers.chat import (
+        GuardrailDecisionRequest,
+        agent_status,
+        guardrail_decision,
+    )
+    from dataclaw.pending_actions import register_guardrail_action
+    from dataclaw.storage import sessions
+
+    tracker = run_tracker.RunTracker()
+    monkeypatch.setattr(run_tracker, "_tracker", tracker)
+    created = await sessions.create_session(title="Durable approval")
+    run = tracker.start_run(created["id"], "run-approval")
+    event = asyncio.Event()
+    approval_id = "guardrail-durable"
+    run.guardrail_approvals[approval_id] = event
+    await register_guardrail_action(
+        run,
+        approval_id=approval_id,
+        guardrail_id="confirm_delete",
+        tool_call_id="call-delete",
+        message="Delete the generated files?",
+        tool_name="delete_files",
+        tool_input={"paths": ["reports/draft.html"]},
+    )
+    tracker.transition_run(created["id"], "waiting_approval")
+
+    status = await agent_status(created["id"])
+    assert status["status"] == "waiting_approval"
+    assert status["requires_user_action"] is True
+    assert status["pending_actions"][0]["tool"]["name"] == "delete_files"
+
+    first = await guardrail_decision(
+        created["id"],
+        approval_id,
+        GuardrailDecisionRequest(approved=False, feedback="Keep the draft."),
+    )
+    assert first == {
+        "ok": True,
+        "approved": False,
+        "state": "denied",
+        "idempotent": False,
+    }
+    assert event.is_set()
+    assert run.guardrail_decisions[approval_id]["feedback"] == "Keep the draft."
+
+    duplicate = await guardrail_decision(
+        created["id"],
+        approval_id,
+        GuardrailDecisionRequest(approved=False, feedback="Keep the draft."),
+    )
+    assert duplicate["idempotent"] is True
+
+    with pytest.raises(HTTPException) as conflict:
+        await guardrail_decision(
+            created["id"],
+            approval_id,
+            GuardrailDecisionRequest(approved=True),
+        )
+    assert conflict.value.status_code == 409
+
+    stored = await sessions.get_session(created["id"])
+    action = stored["pendingActions"][0]
+    assert action["state"] == "denied"
+    assert action["feedback"] == "Keep the draft."
 
 
 # ── Loose visual normalization for compatibility App view ──────────────────

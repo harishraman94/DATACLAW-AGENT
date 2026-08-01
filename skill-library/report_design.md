@@ -62,7 +62,10 @@ credentials, connection strings, PII, or unbounded row collections.
    document authored by the ledger-backed creative author; there is no
    presentation mode to select.
 3. Inspect `analytical_review`, `design_review`, `authoring_review`, source
-   coverage, evidence-review status, and quality. Resolve required analytical
+   coverage, evidence-review status, and quality. Analytical-completeness
+   findings are advisory by default: disclose them and continue without
+   regenerating the report. For genuinely high-risk work, opt in with
+   `requirements.analysis_review.enforcement="strict"`; then resolve required
    findings with real evidence or obtain explicit user-approved risk acceptance.
    Treat design, layout, chart-variety, and story-arc warnings as editorial
    advice unless the user explicitly made one a requirement.
@@ -199,8 +202,9 @@ records it as verified, missing, invalid, or stale, but does not block on it.
 Do not declare the report complete unless:
 
 - the evidence review and artifact-safety validation pass;
-- every required analytical finding is resolved or explicitly accepted by the
-  user; editorial and layout warnings are reviewed but are not publication gates;
+- every strict analytical finding is resolved or explicitly accepted by the
+  user; advisory analytical, editorial, and layout findings are disclosed but
+  are not publication gates;
 - material caveats, uncertainty, units, and denominators remain visible;
 - browser review is approved for the exact HTML when the user explicitly opted
   into that review;

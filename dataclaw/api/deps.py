@@ -6,7 +6,6 @@ import logging
 
 from fastapi import Request
 
-from dataclaw.config.resolver import resolve
 from dataclaw.hooks.registry import HookRegistry
 from dataclaw.plugins.registry import ProviderRegistry
 
@@ -28,7 +27,13 @@ def init_providers(registry: ProviderRegistry) -> DefaultToolAvailability:
 
     Returns the tool_registry so it can be passed into PluginContext.
     """
-    llm = llm_from_config()
+    # The initial provider set is provisional. External runtimes register
+    # factories during plugin registration and the post-registration selection
+    # pass in app.py chooses the configured runtime.
+    # Plugin registration needs a harmless provisional provider set. The
+    # post-registration runtime selection publishes the configured utility
+    # model and agent runtime as one immutable bundle.
+    llm = llm_from_config(backend="mock")
 
     registry.llm = llm
     registry.compaction = compaction_from_config(llm)
@@ -79,22 +84,7 @@ def init_providers(registry: ProviderRegistry) -> DefaultToolAvailability:
         fn=skill_provider.list_available_skills,
     ))
 
-    # Set up agent provider based on configured backend
-    backend = resolve("llm.backend", "DATACLAW_LLM_BACKEND", "openclaw")
-    if backend == "openclaw":
-        try:
-            from dataclaw_openclaw.agent_provider import OpenClawAgentProvider
-            url = resolve("plugins.openclaw.url", "DATACLAW_OPENCLAW_URL", "http://127.0.0.1:18789")
-            token = resolve("plugins.openclaw.token", "DATACLAW_TOKEN",
-                    resolve("plugins.openclaw.frontend_token", "DATACLAW_FRONTEND_TOKEN", ""))
-            wait_ms = int(resolve("plugins.openclaw.wait_ms", "DATACLAW_OPENCLAW_WAIT_MS", "0"))
-            registry.agent = OpenClawAgentProvider(url=url, token=token, wait_ms=wait_ms)
-            logger.info("Agent provider: OpenClaw (%s)", url)
-        except ImportError:
-            logger.warning("dataclaw-openclaw plugin not installed, falling back to LangChain agent")
-            registry.agent = LangChainAgentProvider(llm)
-    else:
-        registry.agent = LangChainAgentProvider(llm)
+    registry.agent = LangChainAgentProvider(llm)
 
     registry.sub_agent_registry.register(DefaultSubAgentProvider(llm))
 

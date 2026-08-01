@@ -34,6 +34,8 @@ workspaces/
 docker-data/
 dataclaw-data/   # legacy bundled-compose mount path (now docker-data/dataclaw)
 data/
+# locally downloaded competition datasets
+kaggle-analysis/
 
 # Testing
 .pytest_cache/
@@ -53,4 +55,6 @@ ui/build/
 
 # Local-only planning, research, and documentation
 .local-planning/
-docs/
+docs/*
+!docs/hermes-runtime-plan.md
+!docs/hermes-runtime-implementation-spec.md

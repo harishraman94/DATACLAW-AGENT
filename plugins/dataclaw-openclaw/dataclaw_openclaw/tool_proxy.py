@@ -172,7 +172,9 @@ async def tool_call_proxy(tool_name: str, body: ToolCallBody, request: Request) 
     # Emit tool call start events to tracker (if a run is active for this session)
     run = tracker.get_run(session_id)
     emitter: AgentEventEmitter | None = None
-    if run and run.status == "running":
+    from dataclaw.api.run_tracker import is_live
+
+    if run and is_live(run.status):
         emitter = AgentEventEmitter(session_id, run.run_id)
         tracker.append_event(session_id, emitter.tool_call_start(call_id, tool_name))
         tracker.append_event(session_id, emitter.tool_call_args(

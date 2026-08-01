@@ -1,9 +1,4 @@
-"""dataclaw-openclaw — OpenClaw agent runtime plugin.
-
-Replaces the default AgentProvider with one that delegates to an
-OpenClaw instance. Tool calls from OpenClaw are executed directly
-via the tool proxy; final responses arrive via the callback endpoint.
-"""
+"""dataclaw-openclaw — OpenClaw agent runtime plugin."""
 
 from __future__ import annotations
 
@@ -17,7 +12,6 @@ from dataclaw.plugins.base import (
     PluginConfigField,
 )
 
-from dataclaw_openclaw.agent_provider import OpenClawAgentProvider
 from dataclaw_openclaw.install_router import router as install_router
 from dataclaw_openclaw.skill_sync import router as skill_sync_router
 from dataclaw_openclaw.tool_proxy import router as tool_proxy_router
@@ -44,20 +38,62 @@ class OpenClawPlugin:
             ctx.session_cleanup_registry.register("openclaw_bridge", _cleanup_bridge)
         logger.info("OpenClaw plugin: install + skill sync + tool proxy routers registered")
 
-        cfg = ctx.config.plugins.get("openclaw", {})
-        url = cfg.get("url", "")
+        async def _factory(factory_ctx):
+            from dataclaw.config.resolver import resolve
+            from dataclaw.providers.agent.factory import (
+                RuntimeBundle,
+                RuntimeDiagnostics,
+                RuntimeIdentity,
+            )
+            from dataclaw_openclaw.agent_provider import OpenClawAgentProvider
 
-        if not url:
-            logger.info("OpenClaw plugin: no URL configured, skipping agent provider swap")
-            return
+            url = resolve(
+                "plugins.openclaw.url",
+                "DATACLAW_OPENCLAW_URL",
+                "http://127.0.0.1:18789",
+            )
+            token = resolve(
+                "plugins.openclaw.token",
+                "DATACLAW_TOKEN",
+                resolve(
+                    "plugins.openclaw.frontend_token",
+                    "DATACLAW_FRONTEND_TOKEN",
+                    "",
+                ),
+            )
+            wait_ms = int(
+                resolve(
+                    "plugins.openclaw.wait_ms",
+                    "DATACLAW_OPENCLAW_WAIT_MS",
+                    "0",
+                )
+            )
+            provider = OpenClawAgentProvider(
+                url=url, token=token, wait_ms=wait_ms
+            )
+            # Every runtime receives the same DataClaw-owned utility model for
+            # compaction and delegated sub-agents.
+            base = factory_ctx.base_bundle
+            return RuntimeBundle(
+                agent=provider,
+                utility_llm=base.llm,
+                compaction=base.compaction,
+                tool_availability=base.tool_availability,
+                sub_agent_registry=base.sub_agent_registry,
+                sub_agent_hooks=base.sub_agent_hooks,
+                memory=base.memory,
+                system_prompt=base.system_prompt,
+                skill=base.skill,
+                hooks=factory_ctx.hooks.clone(),
+                runtime_control=None,
+                identity=RuntimeIdentity(runtime="openclaw"),
+                diagnostics=RuntimeDiagnostics(
+                    details={"url": url}
+                ),
+            )
 
-        token = cfg.get("token", cfg.get("frontend_token", cfg.get("tools_token", "")))
-        wait_ms = int(cfg.get("wait_ms", 0))
-
-        # Replace the agent provider
-        provider = OpenClawAgentProvider(url=url, token=token, wait_ms=wait_ms)
-        ctx.providers.replace("agent", provider)
-        logger.info("OpenClaw plugin: agent provider replaced (url=%s)", url)
+        ctx.providers.register_runtime_factory("openclaw", _factory)
+        logger.info("OpenClaw plugin: runtime factory registered")
 
     def ui_manifest(self) -> PluginUIManifest:
         return PluginUIManifest(

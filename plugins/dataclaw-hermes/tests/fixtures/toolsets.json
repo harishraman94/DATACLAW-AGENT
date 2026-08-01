@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "name": "dataclaw",
+      "enabled": true,
+      "tools": [
+        "dataclaw_tool",
+        "dataclaw_tool_search"
+      ]
+    },
+    {
+      "name": "terminal",
+      "enabled": false,
+      "tools": [
+        "terminal"
+      ]
+    }
+  ]
+}

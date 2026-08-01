@@ -660,6 +660,14 @@ def _evidence_refs_from_value(value: Any) -> list[dict[str, str]]:
         else:
             kind = "unknown"
             ref = clean_text(entry)
+            # Qualified strings (for example ``notebook_cell:abc123``) are the
+            # common report-handoff form. Preserve the full registry id while
+            # recovering its kind so strict checks accept evidence the ordinary
+            # ledger already resolves.
+            if ":" in ref:
+                candidate_kind = ref.split(":", 1)[0]
+                if candidate_kind in _EVIDENCE_REF_KINDS:
+                    kind = candidate_kind
         if ref:
             refs.append({"kind": kind, "ref": ref})
     return refs
@@ -870,6 +878,19 @@ _PREDICTIVE_REVIEW_TERMS = (
     "likelihood",
     "odds",
 )
+_EVIDENCE_REF_KINDS = {
+    "artifact",
+    "artifact_section",
+    "dataset_profile",
+    "external",
+    "file",
+    "finding",
+    "hypothesis",
+    "inline_summary",
+    "notebook_cell",
+    "query_card",
+}
+_STRICT_REVIEW_ENFORCEMENT = {"strict", "block", "blocking", "required", "fail"}
 _BASELINE_REVIEW_TERMS = (
     "baseline",
     "ablation",
@@ -968,9 +989,31 @@ def _review_storyboard_analysis(storyboard: dict[str, Any], registry: dict[str, 
     text = _storyboard_review_text(storyboard)
     delivered_text = _storyboard_review_text(storyboard, include_context=False)
     mode = clean_text(contract.get("mode") or "").lower()
-    is_predictive = mode in {"forecast", "forecasting", "predictive", "prediction", "simulation"}
-    if not is_predictive:
-        is_predictive = _contains_any(text, _PREDICTIVE_REVIEW_TERMS)
+    enforcement_raw = clean_text(
+        contract.get("enforcement")
+        or contract.get("gate")
+        or contract.get("policy")
+        or "advisory"
+    ).lower()
+    enforcement = "strict" if enforcement_raw in _STRICT_REVIEW_ENFORCEMENT else "advisory"
+    # An explicit mode is authoritative. Only legacy contracts with no mode
+    # fall back to prose inference, and explicit negative framing prevents
+    # phrases such as "not predictive" from enabling predictive checks.
+    if mode:
+        is_predictive = mode in {
+            "forecast", "forecasting", "model", "prediction", "predictive", "simulation",
+        }
+    else:
+        negative_predictive_framing = _contains_any(text, (
+            "not a forecast",
+            "not a predictive",
+            "not predictive",
+            "no forecast",
+            "no prediction",
+            "no predictive",
+            "non-predictive",
+        ))
+        is_predictive = not negative_predictive_framing and _contains_any(text, _PREDICTIVE_REVIEW_TERMS)
 
     findings: list[dict[str, Any]] = []
 
@@ -1101,6 +1144,8 @@ def _review_storyboard_analysis(storyboard: dict[str, Any], registry: dict[str, 
     return {
         "review_schema": 1,
         "mode": mode or ("predictive" if is_predictive else "general"),
+        "enforcement": enforcement,
+        "blocking": enforcement == "strict",
         "status": "attention_required" if findings else "pass",
         "findings": findings,
         "guardrail": "Findings identify missing declared work; they do not assert that an uninspected analysis is wrong.",
